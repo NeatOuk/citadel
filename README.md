@@ -21,6 +21,8 @@ git clone https://github.com/NeatOuk/citadel-helper.git
 cd citadel-helper && makepkg -si
 ```
 
+An AUR package is coming later.
+
 Its README explains what runs as root and why it is safe. You can install it
 before or after the plugin; Citadel picks it up within a few seconds.
 
