@@ -81,6 +81,18 @@ Panel {
     }
     function removeRule(id: string): void { citadel.removeRule(id) }
     function rules(): string { return JSON.stringify(citadel.rules) }
+    // what Kill would hit for an app group ("exe" or "exe|launcher-id"), and do it
+    function killable(key: string): string {
+      var g = citadel.groups.filter(function(x) { return x.key === key })[0]
+      return JSON.stringify(g ? citadel.killablePids(g) : [])
+    }
+    function killApp(key: string, force: bool): int {
+      var g = citadel.groups.filter(function(x) { return x.key === key })[0]
+      return g ? citadel.killGroup(g, force) : 0
+    }
+    function groups(): string {
+      return JSON.stringify(citadel.groups.map(function(g) { return { key: g.key, app: g.app, via: g.via, conns: g.conns.length, system: g.system } }))
+    }
     function setList(id: string, on: bool): void { citadel.setListEnabled(id, on) }
     function lists(): string { return JSON.stringify({ lists: citadel.lists, status: citadel.listStatus, ipCidrs: citadel.ipCidrs.length }) }
     function downloadGeoip(): void { citadel.downloadGeoip() }

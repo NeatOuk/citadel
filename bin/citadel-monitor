@@ -1239,7 +1239,7 @@ def tick(hist, prev, table_cache):
     if short:
         hist.record_short(short)
     net = network_ids()
-    emit({"type": "tick", "ts": now, "uid": MY_UID, "conns": conns, "apps": app_out,
+    emit({"type": "tick", "ts": now, "uid": MY_UID, "selfPid": os.getpid(), "shellPid": os.getppid(), "conns": conns, "apps": app_out,
           "totals": {"rx": rx, "tx": tx}, "network": {"names": net["names"], "ssid": net["ssid"], "source": net["source"]},
           "short": short,
           "kernelLog": {"running": kernel_state["running"], "error": kernel_state["error"], "seen": kernel_state["seen"]},

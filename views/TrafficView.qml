@@ -12,6 +12,8 @@ Column {
   property var s: null
   property bool showSystem: false
   property var expanded: ({})
+  property string killArmed: ""            // group key waiting for the confirming click
+  property var killed: ({})                // group key -> {pids, ts} after a kill
 
   spacing: Style.space(8)
 
@@ -33,6 +35,32 @@ Column {
     if (d.source === "silent") return v + (d.verdict === "deny" ? " (lockdown)" : " (open mode)")
     return v
   }
+  function kill(group) {
+    var k = killed[group.key]
+    if (k && root.s.stillRunning(k.pids) > 0 && root.s.now - k.ts >= 3) {
+      root.s.killGroup(group, true)                    // still alive: force
+      root.killed = Object.assign({}, root.killed, (function() { var o = {}; o[group.key] = { pids: k.pids, ts: root.s.now, forced: true }; return o })())
+      return
+    }
+    if (root.killArmed !== group.key) { root.killArmed = group.key; disarm.restart(); return }
+    var pids = root.s.killablePids(group)
+    root.s.killGroup(group, false)
+    root.killArmed = ""
+    var o = Object.assign({}, root.killed); o[group.key] = { pids: pids, ts: root.s.now }; root.killed = o
+  }
+  function killText(group) {
+    var n = root.s.killablePids(group).length
+    var k = killed[group.key]
+    if (k) {
+      var left = root.s.stillRunning(k.pids)
+      if (left === 0) return "Killed"
+      return root.s.now - k.ts >= 3 ? "Force kill" : "Stopping…"
+    }
+    if (root.killArmed === group.key) return "Kill " + n + (n === 1 ? " process?" : " processes?")
+    return "Kill"
+  }
+  Timer { id: disarm; interval: 4000; onTriggered: root.killArmed = "" }
+
   function toggle(key) {
     var e = Object.assign({}, expanded)
     e[key] = !e[key]
@@ -138,6 +166,14 @@ Column {
             text: grp.appRule && grp.appRule.action === "allow" ? "Allowed ✓" : "Allow app"
             onClicked: grp.appRule && grp.appRule.action === "allow"
               ? root.s.removeRule(grp.appRule.id) : root.s.allowApp(grp.modelData.exe, grp.modelData.viaId)
+          }
+          LinkButton {
+            p: root.p
+            danger: true
+            visible: root.s.killablePids(grp.modelData).length > 0 || !!root.killed[grp.modelData.key]
+            text: root.killText(grp.modelData)
+            font.bold: root.killArmed === grp.modelData.key
+            onClicked: if (root.killText(grp.modelData) !== "Killed" && root.killText(grp.modelData) !== "Stopping…") root.kill(grp.modelData)
           }
           LinkButton {
             p: root.p

@@ -64,6 +64,7 @@ Item {
   property var ipCidrs: []
   property var geoip: ({ installed: false, error: "" })
   property var approx: ({})
+  property var protectedPids: ({})          // Citadel's monitor and the shell hosting it
   property var recentShort: []              // short connections the poll missed (newest first)
   property var kernelLog: ({ running: false, error: "", seen: 0 })
   property string helperVersion: ""         // from `citadel-enforcer status` (1.2+)
@@ -209,6 +210,7 @@ Item {
   function _onTick(m) {
     now = m.ts || Date.now() / 1000
     if (m.uid !== undefined) uid = m.uid
+    if (m.selfPid) { var pp = {}; pp[m.selfPid] = true; pp[m.shellPid] = true; protectedPids = pp }
     conns = m.conns || []
     apps = m.apps || {}
     network = m.network || { names: [], ssid: "" }
@@ -401,6 +403,53 @@ Item {
   function denyApp(exe, viaId) { addRule({ app: exe, via: viaId || "*", action: "deny" }) }
   function denyConn(conn) { addRule({ app: conn.exe || "*", via: conn.viaId || "*", host: conn.host || conn.raddr, action: "deny" }) }
   function allowConn(conn) { addRule({ app: conn.exe || "*", via: conn.viaId || "*", host: conn.host || conn.raddr, action: "allow" }) }
+
+  // ------------------------------------------------- kill (your own processes only)
+  // Session pieces that must never be killed from here.
+  readonly property var protectedNames: ["quickshell", "qs", "Hyprland", "hyprland", "systemd", "uwsm",
+    "dbus-broker", "dbus-broker-launch", "dbus-daemon", "pipewire", "pipewire-pulse", "wireplumber",
+    "Xwayland", "xdg-desktop-portal", "xdg-desktop-portal-hyprland", "gnome-keyring-daemon"]
+
+  function _isProtectedCmd(cmd) {
+    var first = String(cmd || "").split(" ").slice(0, 3).join(" ")
+    return protectedNames.some(function(n) { return new RegExp("(^|[/\\s])" + n + "(\\s|$)").test(first) })
+  }
+
+  // pids to kill for a Traffic group:
+  //  - a normal app: every process of that program
+  //  - "app via launcher", or an interpreter (python, node, bash…): only the
+  //    processes owning this group's connections, never every script that
+  //    happens to run on the same interpreter
+  function killablePids(group) {
+    if (!group || group.system || !group.exe) return []
+    var name = group.exe.split("/").pop()
+    if (protectedNames.indexOf(name) !== -1) return []
+    var interpreter = /^(python|node|perl|ruby|bash|sh|dash|zsh|fish|lua|luajit|deno|bun|php)[0-9.]*$/.test(name)
+    var pids = []
+    if (group.viaId || interpreter)
+      group.conns.forEach(function(c) { if (c.pid && !_isProtectedCmd(c.cmd)) pids.push(c.pid) })
+    else pids = ((apps[group.exe] || {}).pids || []).slice()
+    var seen = {}
+    return pids.filter(function(p) {
+      if (!p || seen[p] || protectedPids[p]) return false
+      seen[p] = true
+      return true
+    })
+  }
+  function killGroup(group, force) {
+    var pids = killablePids(group)
+    if (!pids.length) return 0
+    Quickshell.execDetached(["kill", force ? "-KILL" : "-TERM"].concat(pids.map(String)))
+    var c = group.conns && group.conns.length ? group.conns[0] : { app: group.app, exe: group.exe }
+    _log([{ ts: now, app: Model.appWithOrigin(c), exe: group.exe, via: group.viaId || "", dest: pids.length + " process(es)",
+            ip: "", port: "", cc: "", verdict: "deny", source: force ? "force-killed by you" : "killed by you" }])
+    return pids.length
+  }
+  function stillRunning(pids) {
+    var alive = {}
+    for (var exe in apps) (apps[exe].pids || []).forEach(function(p) { alive[p] = true })
+    return (pids || []).filter(function(p) { return alive[p] }).length
+  }
 
   function exportRules() { return JSON.stringify({ version: 2, rules: rules }, null, 2) }
   function importRules(text) {
