@@ -1,0 +1,878 @@
+#!/usr/bin/env python3
+"""Citadel monitor: a long-running user process for the Citadel shell plugin.
+
+Every tick it prints one JSON line on stdout that the Service reads:
+  {"type":"tick", ...}      live connections, apps, totals, network
+  {"type":"stats", ...}     traffic series + top apps/hosts/countries (sqlite)
+  {"type":"resolved", ...}  forward DNS for hosts named in rules
+  {"type":"lists", ...}     blocklist subscription status (+ IP CIDRs)
+  {"type":"geoip", ...}     GeoIP database status
+  {"type":"log", ...}       non-fatal errors
+
+It reads JSON commands on stdin, one per line:
+  {"cmd":"config","interval":2,"retentionDays":30,"resolveHosts":[...],
+   "lists":[{"id","url","kind":"ip"|"domain","enabled"}]}
+  {"cmd":"refreshLists"}   {"cmd":"geoipDownload"}   {"cmd":"stats"}
+
+Only stdlib is required. GeoIP needs python-maxminddb (optional).
+"""
+import concurrent.futures
+import datetime
+import gzip
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import select
+import socket
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+
+HOME = os.path.expanduser("~")
+STATE = os.path.join(HOME, ".local/share/citadel")
+LISTS_DIR = os.path.join(STATE, "lists")
+GEO_DIR = os.path.join(STATE, "geo")
+GEO_DB = os.path.join(GEO_DIR, "dbip-country-lite.mmdb")
+HISTORY_DB = os.path.join(STATE, "history.db")
+MY_UID = os.getuid()
+UA = "citadel/1.0"
+
+cfg = {"interval": 2.0, "retentionDays": 30, "resolveHosts": [], "lists": []}
+out_lock = threading.Lock()
+
+
+def emit(obj):
+    line = json.dumps(obj, separators=(",", ":"))
+    with out_lock:
+        try:
+            sys.stdout.write(line + "\n")
+            sys.stdout.flush()
+        except BrokenPipeError:
+            os._exit(0)
+
+
+def log(msg):
+    emit({"type": "log", "msg": str(msg)[:500]})
+
+
+# ------------------------------------------------------------------ ss parsing
+
+USERS = re.compile(r'users:\(\("([^"]*)",pid=(\d+),fd=\d+')
+UIDF = re.compile(r"\buid:(\d+)")
+CGF = re.compile(r"\bcgroup:(\S+)")
+
+
+def split_addr(field):
+    field = field.strip()
+    if field.startswith("["):
+        host, _, port = field[1:].partition("]:")
+    else:
+        host, _, port = field.rpartition(":")
+    host = host.split("%", 1)[0]          # 192.168.5.6%wlp0s20f3
+    if host.startswith("::ffff:") and "." in host:
+        host = host[7:]
+    return host, (int(port) if port.isdigit() else 0)
+
+
+def parse_ss(args, proto):
+    try:
+        text = subprocess.run(["ss", "-H", "-n", "-p", "-e", "--cgroup"] + args,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    rows, cur = [], None
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        if line[0] in " \t":                          # -i info line
+            if cur is not None:
+                m = re.search(r"bytes_sent:(\d+)", line)
+                if m:
+                    cur["up"] = int(m.group(1))
+                m = re.search(r"bytes_received:(\d+)", line)
+                if m:
+                    cur["down"] = int(m.group(1))
+            continue
+        toks = line.split()
+        # tcp with state filter: Recv-Q Send-Q Local Peer ...
+        # (when several states are requested, ss prints the state first)
+        if not toks[0].isdigit():
+            state, toks = toks[0], toks[1:]
+        else:
+            state = "ESTAB"
+        if len(toks) < 4:
+            continue
+        laddr, lport = split_addr(toks[2])
+        raddr, rport = split_addr(toks[3])
+        if not raddr or rport == 0 or raddr in ("*", "0.0.0.0", "::"):
+            continue
+        m = USERS.search(line)
+        comm, pid = (m.group(1), int(m.group(2))) if m else ("", 0)
+        m = UIDF.search(line)
+        uid = int(m.group(1)) if m else 0
+        m = CGF.search(line)
+        cg = m.group(1) if m else ""
+        cur = {"proto": proto, "state": state, "laddr": laddr, "lport": lport,
+               "raddr": raddr, "rport": rport, "comm": comm, "pid": pid,
+               "uid": uid, "cgroup": cg, "up": 0, "down": 0}
+        rows.append(cur)
+    return rows
+
+
+def classify(ip):
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return "other"
+    if a.is_loopback:
+        return "loopback"
+    if a.is_private or a.is_link_local:
+        return "lan"
+    if a.is_multicast:
+        return "multicast"
+    return "internet"
+
+
+# ------------------------------------------------------------------ processes
+
+def read(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return default
+
+
+def proc_table():
+    """pid -> (exe, cgroup) for this user's processes."""
+    table = {}
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            if os.stat("/proc/" + d).st_uid != MY_UID:
+                continue
+            exe = os.readlink("/proc/%s/exe" % d)
+        except OSError:
+            continue
+        cg = read("/proc/%s/cgroup" % d).strip()
+        cg = cg.split("::", 1)[1] if "::" in cg else ""
+        table[int(d)] = (exe, cg)
+    return table
+
+
+def apps_from(table):
+    """exe -> {pids, cgroups, owned}: a cgroup is 'owned' by an exe when every
+    process in it is that exe or lives in the same directory (helpers such as
+    chrome_crashpad_handler). Only owned cgroups are safe to block whole."""
+    by_cg = {}
+    for pid, (exe, cg) in table.items():
+        by_cg.setdefault(cg, set()).add(exe.replace(" (deleted)", ""))
+    apps = {}
+    for pid, (exe, cg) in table.items():
+        clean = exe.replace(" (deleted)", "")
+        a = apps.setdefault(clean, {"pids": [], "cgroups": set(), "owned": set(),
+                                    "deleted": False})
+        a["pids"].append(pid)
+        a["cgroups"].add(cg)
+        if exe.endswith(" (deleted)"):
+            a["deleted"] = True
+    for exe, a in apps.items():
+        base = os.path.dirname(exe)
+        for cg in a["cgroups"]:
+            if cg and all(e == exe or os.path.dirname(e) == base for e in by_cg.get(cg, ())):
+                a["owned"].add(cg)
+    return apps
+
+
+# ------------------------------------------------------------------ trust
+
+trust_cache = {}
+owner_cache = {}
+
+
+def pkg_owner(path):
+    if path in owner_cache:
+        return owner_cache[path]
+    try:
+        p = subprocess.run(["pacman", "-Qqo", path], stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, text=True, timeout=10)
+        name = p.stdout.strip().splitlines()[0] if p.returncode == 0 and p.stdout.strip() else ""
+    except (OSError, subprocess.TimeoutExpired, IndexError):
+        name = ""
+    owner_cache[path] = name
+    return name
+
+
+def mtree_digest(pkg, path):
+    """sha256 recorded by pacman for this file, from the local db mtree."""
+    base = "/var/lib/pacman/local"
+    try:
+        dirs = [d for d in os.listdir(base) if d.startswith(pkg + "-")]
+    except OSError:
+        return None
+    want = "./" + path.lstrip("/")
+    for d in dirs:
+        desc = read(os.path.join(base, d, "desc"))
+        if ("%%NAME%%\n%s\n" % pkg) not in desc:
+            continue
+        try:
+            with gzip.open(os.path.join(base, d, "mtree"), "rt", errors="replace") as f:
+                for line in f:
+                    if line.startswith(want + " "):
+                        m = re.search(r"sha256digest=([0-9a-f]{64})", line)
+                        return m.group(1) if m else None
+        except OSError:
+            return None
+    return None
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def trust(exe, deleted=False):
+    """level: verified | modified | unpackaged | suspicious | unknown"""
+    if not exe:
+        return {"level": "unknown"}
+    try:
+        st = os.stat(exe)
+        key = (exe, st.st_ino, st.st_mtime_ns, st.st_size)
+    except OSError:
+        return {"level": "suspicious" if deleted else "unknown", "reason": "missing"}
+    if key in trust_cache and not deleted:
+        return trust_cache[key]
+    if deleted:
+        return {"level": "suspicious", "reason": "binary deleted since start"}
+    if re.match(r"^/(tmp|var/tmp|dev/shm|run/user/\d+)/", exe):
+        t = {"level": "suspicious", "reason": "runs from a temporary folder"}
+    else:
+        try:
+            digest = sha256(exe)
+        except OSError:
+            digest = ""
+        pkg = pkg_owner(exe)
+        if pkg:
+            want = mtree_digest(pkg, os.path.realpath(exe))
+            if want and digest == want:
+                t = {"level": "verified", "pkg": pkg}
+            elif want:
+                t = {"level": "modified", "pkg": pkg, "reason": "differs from package"}
+            else:
+                t = {"level": "verified", "pkg": pkg, "reason": "no checksum in package"}
+        else:
+            t = {"level": "unpackaged", "reason": "not from a pacman package"}
+        t["hash"] = digest
+    trust_cache[key] = t
+    return t
+
+
+# ------------------------------------------------------------------ DNS
+
+rdns_cache = {}         # ip -> (name|"", ts)
+rdns_pending = set()
+pool = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+fwd_cache = {}          # host -> {"ips": [...], "ts": t}
+
+
+def _rdns(ip):
+    try:
+        name = socket.gethostbyaddr(ip)[0]
+    except (OSError, UnicodeError):
+        name = ""
+    rdns_cache[ip] = (name, time.time())
+    rdns_pending.discard(ip)
+
+
+def rdns(ip):
+    hit = rdns_cache.get(ip)
+    if hit and time.time() - hit[1] < 3600:
+        return hit[0] or None
+    if ip not in rdns_pending and classify(ip) in ("internet", "lan"):
+        rdns_pending.add(ip)
+        pool.submit(_rdns, ip)
+    return hit[0] if hit and hit[0] else None
+
+
+def resolve_hosts(force=False):
+    out = {}
+    now = time.time()
+    for h in cfg.get("resolveHosts") or []:
+        h = str(h).strip().lower()
+        if not h:
+            continue
+        c = fwd_cache.get(h)
+        if c and not force and now - c["ts"] < 300:
+            out[h] = c["ips"]
+            continue
+        try:
+            ips = sorted({ai[4][0] for ai in socket.getaddrinfo(h, None)})
+        except (OSError, UnicodeError):
+            ips = []
+        fwd_cache[h] = {"ips": ips, "ts": now}
+        out[h] = ips
+    emit({"type": "resolved", "hosts": out})
+
+
+# ------------------------------------------------------------------ GeoIP
+
+geo = {"reader": None, "mtime": 0, "error": ""}
+
+
+def geo_reader():
+    try:
+        mt = os.path.getmtime(GEO_DB)
+    except OSError:
+        geo["reader"] = None
+        return None
+    if geo["reader"] is None or mt != geo["mtime"]:
+        try:
+            import maxminddb
+            geo["reader"] = maxminddb.open_database(GEO_DB)
+            geo["mtime"] = mt
+            geo["error"] = ""
+        except ImportError:
+            geo["error"] = "python-maxminddb is not installed"
+            geo["reader"] = None
+        except Exception as e:                           # corrupt file
+            geo["error"] = str(e)[:200]
+            geo["reader"] = None
+    return geo["reader"]
+
+
+geo_cache = {}
+
+
+def country(ip):
+    if ip in geo_cache:
+        return geo_cache[ip]
+    r = geo_reader()
+    cc = ""
+    if r and classify(ip) == "internet":
+        try:
+            rec = r.get(ip) or {}
+            cc = ((rec.get("country") or {}).get("iso_code")) or ""
+        except Exception:
+            cc = ""
+    if r:
+        geo_cache[ip] = cc
+    return cc
+
+
+def geo_status():
+    r = geo_reader()
+    st = {"type": "geoip", "installed": r is not None, "error": geo["error"]}
+    if r is not None:
+        st["updated"] = int(geo["mtime"])
+    emit(st)
+
+
+def geo_download():
+    def run():
+        try:
+            os.makedirs(GEO_DIR, exist_ok=True)
+            last = None
+            for months_back in (0, 1):
+                d = datetime.date.today().replace(day=1) - datetime.timedelta(days=31 * months_back)
+                url = "https://download.db-ip.com/free/dbip-country-lite-%04d-%02d.mmdb.gz" % (d.year, d.month)
+                try:
+                    req = urllib.request.Request(url, headers={"User-Agent": UA})
+                    with urllib.request.urlopen(req, timeout=60) as resp:
+                        data = gzip.decompress(resp.read())
+                    tmp = GEO_DB + ".tmp"
+                    with open(tmp, "wb") as f:
+                        f.write(data)
+                    os.replace(tmp, GEO_DB)
+                    geo_cache.clear()
+                    geo["reader"] = None
+                    geo_status()
+                    return
+                except Exception as e:
+                    last = e
+            emit({"type": "geoip", "installed": geo_reader() is not None,
+                  "error": "download failed: %s" % last})
+        except Exception as e:
+            emit({"type": "geoip", "installed": False, "error": str(e)[:200]})
+    threading.Thread(target=run, daemon=True).start()
+
+
+# ------------------------------------------------------------------ blocklists
+
+lists_state = {"domains": {}, "ips": {}, "nets": {}, "meta": {}}   # id -> set / list / nets / meta
+ip_match_cache = {}
+lists_lock = threading.Lock()
+DOMAIN_RE = re.compile(r"^[a-z0-9_-]+(\.[a-z0-9_-]+)+$")
+
+
+# Address space an IP blocklist must never cover: LAN, loopback, link-local,
+# CGNAT/Tailscale, multicast and reserved. Lists such as FireHOL level 1
+# include these "bogons", which would cut the user off from their own network.
+NEVER_BLOCK = [ipaddress.ip_network(n) for n in (
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+    "172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15", "224.0.0.0/3",
+    "::/127", "::ffff:0:0/96", "64:ff9b::/96", "fc00::/7", "fe80::/10", "ff00::/8")]
+
+
+def safe_to_block(net):
+    return not any(net.version == n.version and net.overlaps(n) for n in NEVER_BLOCK)
+
+
+def parse_list(kind, text):
+    if kind == "ip":
+        nets = []
+        for line in text.splitlines():
+            line = line.split("#", 1)[0].split(";", 1)[0].strip()
+            if not line:
+                continue
+            tok = line.split()[0]
+            try:
+                net = ipaddress.ip_network(tok, strict=False)
+            except ValueError:
+                continue
+            if safe_to_block(net):
+                nets.append(str(net))
+        return nets
+    doms = set()
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip().lower()
+        if not line:
+            continue
+        parts = line.split()
+        # hosts format "0.0.0.0 domain", adblock "||domain^", or bare domain
+        tok = parts[1] if len(parts) >= 2 and parts[0] in ("0.0.0.0", "127.0.0.1", "::", "::1") else parts[0]
+        tok = tok.strip("|^").lstrip("*.")
+        if DOMAIN_RE.match(tok) and tok not in ("localhost", "localhost.localdomain"):
+            doms.add(tok)
+    return doms
+
+
+def list_path(lid):
+    return os.path.join(LISTS_DIR, re.sub(r"[^A-Za-z0-9_.-]", "_", lid) + ".txt")
+
+
+def load_lists(download=False):
+    def run():
+        os.makedirs(LISTS_DIR, exist_ok=True)
+        domains, ips, meta = {}, {}, {}
+        for L in cfg.get("lists") or []:
+            lid, url, kind = str(L.get("id")), str(L.get("url", "")), L.get("kind", "domain")
+            if not L.get("enabled", True) or not lid:
+                continue
+            path = list_path(lid)
+            err = ""
+            stale = not os.path.exists(path) or time.time() - os.path.getmtime(path) > 86400
+            if url.startswith(("https://", "http://")) and (download or stale):
+                try:
+                    req = urllib.request.Request(url, headers={"User-Agent": UA})
+                    with urllib.request.urlopen(req, timeout=60) as resp:
+                        data = resp.read(64 * 1024 * 1024)
+                    with open(path + ".tmp", "wb") as f:
+                        f.write(data)
+                    os.replace(path + ".tmp", path)
+                except Exception as e:
+                    err = "download failed: %s" % e
+            text = read(path)
+            parsed = parse_list(kind, text) if text else ([] if kind == "ip" else set())
+            if kind == "ip":
+                ips[lid] = parsed
+            else:
+                domains[lid] = parsed
+            meta[lid] = {"id": lid, "kind": kind, "count": len(parsed), "error": err,
+                         "updated": int(os.path.getmtime(path)) if os.path.exists(path) else 0}
+        nets = {}
+        for lid, cidrs in ips.items():
+            by_len = {}
+            for c in cidrs:
+                n = ipaddress.ip_network(c)
+                by_len.setdefault((n.version, n.prefixlen), set()).add(int(n.network_address))
+            nets[lid] = by_len
+        with lists_lock:
+            lists_state["domains"], lists_state["ips"], lists_state["meta"] = domains, ips, meta
+            lists_state["nets"] = nets
+            ip_match_cache.clear()
+        all_ips = sorted({n for v in ips.values() for n in v})
+        emit({"type": "lists", "lists": list(meta.values()), "ipCidrs": all_ips})
+    threading.Thread(target=run, daemon=True).start()
+
+
+def ip_list_match(ip):
+    """IP -> id of the first IP blocklist containing it (prefix-length buckets)."""
+    if ip in ip_match_cache:
+        return ip_match_cache[ip]
+    hit = ""
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        a = None
+    if a is not None:
+        bits = 32 if a.version == 4 else 128
+        val = int(a)
+        with lists_lock:
+            for lid, by_len in lists_state["nets"].items():
+                for (ver, plen), starts in by_len.items():
+                    if ver == a.version and ((val >> (bits - plen)) << (bits - plen)) in starts:
+                        hit = lid
+                        break
+                if hit:
+                    break
+    ip_match_cache[ip] = hit
+    return hit
+
+
+def list_match(host, ip=""):
+    hit = ip_list_match(ip) if ip else ""
+    if hit or not host:
+        return hit
+    h = host.lower().rstrip(".")
+    with lists_lock:
+        doms = lists_state["domains"]
+        if not doms:
+            return ""
+        parts = h.split(".")
+        for i in range(len(parts) - 1):
+            cand = ".".join(parts[i:])
+            for lid, s in doms.items():
+                if cand in s:
+                    return lid
+    return ""
+
+
+# ------------------------------------------------------------------ network id
+
+net_state = {"ts": 0, "names": [], "ssid": "", "source": "none"}
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _run(cmd, timeout=5):
+    """stdout of a command, or None if it is missing or fails."""
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return p.stdout if p.returncode == 0 else None
+
+
+def nm_networks():
+    """Active NetworkManager connection names -> (names, ssid) or None."""
+    out = _run(["nmcli", "-t", "-f", "NAME,TYPE", "con", "show", "--active"])
+    if out is None:
+        return None
+    names, ssid = [], ""
+    for line in out.splitlines():
+        name, _, typ = line.rpartition(":")
+        name = name.replace("\\:", ":")
+        if not name or typ in ("loopback", "tun", "wireguard", "bridge"):
+            continue
+        names.append(name)
+        if typ == "802-11-wireless" and not ssid:
+            ssid = name
+    return names, ssid
+
+
+def parse_iwctl_devices(text):
+    """Device names from `iwctl station list`."""
+    devs = []
+    for line in ANSI.sub("", text).splitlines():
+        parts = line.split()
+        # rows look like "  wlan0   connected   " under a dashed header
+        if len(parts) >= 2 and parts[1] in ("connected", "disconnected", "connecting",
+                                             "disconnecting", "roaming"):
+            devs.append(parts[0])
+    return devs
+
+
+def parse_iwctl_connected(text):
+    """SSID from `iwctl station <dev> show`, or ""."""
+    for line in ANSI.sub("", text).splitlines():
+        m = re.match(r"^\s*Connected network\s+(.+?)\s*$", line)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def iwd_networks():
+    """Connected iwd SSIDs -> (names, ssid) or None when iwd is unavailable."""
+    out = _run(["iwctl", "station", "list"])
+    if out is None:
+        return None
+    names = []
+    for dev in parse_iwctl_devices(out):
+        show = _run(["iwctl", "station", dev, "show"])
+        ssid = parse_iwctl_connected(show or "")
+        if ssid:
+            names.append(ssid)
+    return names, (names[0] if names else "")
+
+
+def wired_networks():
+    """Physical, non-wireless interfaces that are up: "Wired (enp3s0)"."""
+    names = []
+    try:
+        ifaces = sorted(os.listdir("/sys/class/net"))
+    except OSError:
+        return names
+    for n in ifaces:
+        base = "/sys/class/net/" + n
+        if not os.path.exists(base + "/device") or os.path.exists(base + "/wireless"):
+            continue
+        if read(base + "/operstate").strip() == "up":
+            names.append("Wired (%s)" % n)
+    return names
+
+
+def network_ids():
+    """Names that zones can be linked to. NetworkManager connection names when
+    NM runs; otherwise iwd SSIDs plus wired interfaces; otherwise nothing."""
+    if time.time() - net_state["ts"] < 10:
+        return net_state
+    source, names, ssid = "none", [], ""
+    nm = nm_networks()
+    if nm is not None:
+        source, (names, ssid) = "networkmanager", nm
+    else:
+        iw = iwd_networks()
+        wired = wired_networks()
+        if iw is not None:
+            source, names, ssid = "iwd", iw[0] + wired, iw[1]
+        elif wired:
+            source, names = "interfaces", wired
+    net_state.update({"ts": time.time(), "names": names, "ssid": ssid, "source": source})
+    return net_state
+
+
+def iface_totals():
+    rx = tx = 0
+    for line in read("/proc/net/dev").splitlines()[2:]:
+        name, _, rest = line.partition(":")
+        name = name.strip()
+        if not os.path.exists("/sys/class/net/%s/device" % name):
+            continue                      # only physical NICs (skip tun, lo)
+        f = rest.split()
+        try:
+            rx += int(f[0])
+            tx += int(f[8])
+        except (IndexError, ValueError):
+            pass
+    return rx, tx
+
+
+# ------------------------------------------------------------------ history
+
+class History:
+    def __init__(self):
+        os.makedirs(STATE, exist_ok=True)
+        self.db = sqlite3.connect(HISTORY_DB, check_same_thread=False)
+        self.db.executescript("""
+            PRAGMA journal_mode=WAL;
+            CREATE TABLE IF NOT EXISTS flows (
+              id INTEGER PRIMARY KEY, start REAL, last REAL, exe TEXT, comm TEXT,
+              proto TEXT, raddr TEXT, rport INTEGER, host TEXT, cc TEXT,
+              up INTEGER DEFAULT 0, down INTEGER DEFAULT 0, system INTEGER DEFAULT 0);
+            CREATE INDEX IF NOT EXISTS flows_start ON flows(start);
+            CREATE TABLE IF NOT EXISTS samples (t INTEGER PRIMARY KEY, rx INTEGER, tx INTEGER);
+        """)
+        self.ids = {}           # socket key -> row id
+        self.last_prune = 0
+
+    def update(self, conns, now):
+        cur = self.db.cursor()
+        seen = set()
+        for c in conns:
+            k = c["key"]
+            seen.add(k)
+            rid = self.ids.get(k)
+            if rid is None:
+                cur.execute("INSERT INTO flows(start,last,exe,comm,proto,raddr,rport,host,cc,up,down,system)"
+                            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (now, now, c.get("exe") or "", c.get("app") or "", c["proto"], c["raddr"],
+                             c["rport"], c.get("host") or "", c.get("cc") or "", c["up"], c["down"],
+                             1 if c.get("system") else 0))
+                self.ids[k] = cur.lastrowid
+            else:
+                cur.execute("UPDATE flows SET last=?, up=?, down=?, host=COALESCE(NULLIF(?,''),host),"
+                            " cc=COALESCE(NULLIF(?,''),cc) WHERE id=?",
+                            (now, c["up"], c["down"], c.get("host") or "", c.get("cc") or "", rid))
+        for k in list(self.ids):
+            if k not in seen:
+                del self.ids[k]
+        if now - self.last_prune > 3600:
+            cutoff = now - 86400 * max(1, int(cfg.get("retentionDays") or 30))
+            cur.execute("DELETE FROM flows WHERE last < ?", (cutoff,))
+            cur.execute("DELETE FROM samples WHERE t < ?", (int(now) - 86400 * 2,))
+            self.last_prune = now
+        self.db.commit()
+
+    def sample(self, t, rx, tx):
+        self.db.execute("INSERT OR REPLACE INTO samples(t,rx,tx) VALUES(?,?,?)", (t, rx, tx))
+
+    def stats(self):
+        now = time.time()
+        day0 = datetime.datetime.combine(datetime.date.today(), datetime.time()).timestamp()
+        q = self.db.execute
+
+        def top(col, since, n=8):
+            rows = q("SELECT %s, SUM(up), SUM(down), COUNT(*) FROM flows WHERE last >= ? AND system=0"
+                     " AND %s != '' GROUP BY %s ORDER BY SUM(up)+SUM(down) DESC LIMIT ?" % (col, col, col),
+                     (since, n)).fetchall()
+            return [{"name": r[0], "up": r[1] or 0, "down": r[2] or 0, "flows": r[3]} for r in rows]
+
+        # per-minute series for the last hour from 1 s-resolution samples
+        rows = q("SELECT t, rx, tx FROM samples WHERE t >= ? ORDER BY t", (int(now) - 3660,)).fetchall()
+        buckets = {}
+        prev = None
+        for t, rx, tx in rows:
+            if prev is not None and rx >= prev[1] and tx >= prev[2]:
+                b = (t // 60) * 60
+                acc = buckets.setdefault(b, [0, 0])
+                acc[0] += rx - prev[1]
+                acc[1] += tx - prev[2]
+            prev = (t, rx, tx)
+        start = (int(now) // 60) * 60 - 59 * 60
+        series = [{"t": start + i * 60, "down": buckets.get(start + i * 60, [0, 0])[0],
+                   "up": buckets.get(start + i * 60, [0, 0])[1]} for i in range(60)]
+        emit({"type": "stats", "series": series,
+              "topAppsToday": top("comm", day0), "topHostsToday": top("COALESCE(NULLIF(host,''),raddr)", day0),
+              "countriesToday": top("cc", day0, 30), "topApps7d": top("comm", now - 7 * 86400)})
+
+
+# ------------------------------------------------------------------ main loop
+
+def app_name(exe, comm, cg):
+    if exe:
+        return os.path.basename(exe)
+    if comm:
+        return comm
+    unit = cg.rstrip("/").rsplit("/", 1)[-1] if cg else ""
+    return unit or "unknown"
+
+
+def tick(hist, prev, table_cache):
+    now = time.time()
+    rows = parse_ss(["-t", "-i", "state", "established", "state", "syn-sent"], "tcp")
+    rows += parse_ss(["-u", "state", "established"], "udp")
+    table = proc_table()
+    apps = apps_from(table)
+    conns = []
+    for r in rows:
+        kind = classify(r["raddr"])
+        if kind in ("loopback", "multicast"):
+            continue
+        exe = table.get(r["pid"], ("", ""))[0].replace(" (deleted)", "") if r["pid"] else ""
+        system = r["uid"] != MY_UID
+        key = "%s|%s:%d|%s:%d" % (r["proto"], r["laddr"], r["lport"], r["raddr"], r["rport"])
+        p = prev.get(key)
+        dt = max(0.5, now - p["ts"]) if p else 0
+        up_rate = max(0, (r["up"] - p["up"]) / dt) if p else 0
+        down_rate = max(0, (r["down"] - p["down"]) / dt) if p else 0
+        host = rdns(r["raddr"])
+        c = {"key": key, "proto": r["proto"], "state": r["state"].lower(),
+             "raddr": r["raddr"], "rport": r["rport"], "lport": r["lport"],
+             "pid": r["pid"], "exe": exe, "app": app_name(exe, r["comm"], r["cgroup"]),
+             "cgroup": r["cgroup"].lstrip("/"), "system": system, "scope": kind,
+             "host": host or "", "cc": country(r["raddr"]),
+             "up": r["up"], "down": r["down"], "upRate": up_rate, "downRate": down_rate,
+             "new": p is None, "list": list_match(host, r["raddr"]) if not system else ""}
+        conns.append(c)
+    nextprev = {c["key"]: {"ts": now, "up": c["up"], "down": c["down"]} for c in conns}
+
+    app_out = {}
+    for exe, a in apps.items():
+        if not exe or exe.startswith(("/usr/lib/systemd/", "/usr/bin/systemd")):
+            continue
+        t = trust(exe, a["deleted"])
+        app_out[exe] = {"name": os.path.basename(exe), "pids": sorted(a["pids"])[:50],
+                        "cgroups": sorted(c.lstrip("/") for c in a["cgroups"] if c),
+                        "owned": sorted(c.lstrip("/") for c in a["owned"] if c),
+                        "trust": t}
+    rx, tx = iface_totals()
+    hist.sample(int(now), rx, tx)
+    hist.update(conns, now)
+    net = network_ids()
+    emit({"type": "tick", "ts": now, "uid": MY_UID, "conns": conns, "apps": app_out,
+          "totals": {"rx": rx, "tx": tx}, "network": {"names": net["names"], "ssid": net["ssid"], "source": net["source"]},
+          "rdnsPending": len(rdns_pending)})
+    return nextprev
+
+
+def handle(cmd, hist):
+    c = cmd.get("cmd")
+    if c == "config":
+        for k in ("interval", "retentionDays", "resolveHosts", "lists"):
+            if k in cmd:
+                cfg[k] = cmd[k]
+        try:
+            cfg["interval"] = min(60.0, max(1.0, float(cfg["interval"])))
+        except (TypeError, ValueError):
+            cfg["interval"] = 2.0
+        threading.Thread(target=resolve_hosts, daemon=True).start()
+        load_lists(download=False)
+    elif c == "refreshLists":
+        load_lists(download=True)
+    elif c == "geoipDownload":
+        geo_download()
+    elif c == "stats":
+        hist.stats()
+    elif c == "resolve":
+        threading.Thread(target=resolve_hosts, args=(True,), daemon=True).start()
+
+
+def main():
+    hist = History()
+    prev = {}
+    geo_status()
+    last_stats = last_resolve = last_lists = 0
+    buf = b""
+    next_tick = time.time()
+    while True:
+        timeout = max(0.0, next_tick - time.time())
+        r, _, _ = select.select([sys.stdin], [], [], timeout)
+        if r:
+            chunk = os.read(sys.stdin.fileno(), 65536)
+            if not chunk:                      # parent closed stdin: shell gone
+                return
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                try:
+                    handle(json.loads(line.decode("utf-8", "replace")), hist)
+                except ValueError:
+                    log("bad command")
+                except Exception as e:
+                    log("command failed: %s" % e)
+            continue
+        try:
+            prev = tick(hist, prev, None)
+        except Exception as e:
+            log("tick failed: %s" % e)
+        now = time.time()
+        if now - last_stats > 15:
+            try:
+                hist.stats()
+            except Exception as e:
+                log("stats failed: %s" % e)
+            last_stats = now
+        if now - last_resolve > 300:
+            threading.Thread(target=resolve_hosts, daemon=True).start()
+            last_resolve = now
+        if now - last_lists > 3600:            # daily refresh check (stale > 24 h)
+            load_lists(download=False)
+            last_lists = now
+        next_tick = now + float(cfg["interval"])
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
