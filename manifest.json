@@ -34,7 +34,7 @@
     "optional": {
       "networkmanager": "zone switching by connection name (iwd and wired interfaces also work)",
       "python-maxminddb": "countries",
-      "citadel-helper": "enforcement: https://github.com/NeatOuk/citadel-helper (AUR: citadel-helper)"
+      "citadel-helper": "enforcement: https://github.com/NeatOuk/citadel-helper (build with makepkg -si)"
     },
     "groups": {
       "wheel": "run the helper without a password prompt"

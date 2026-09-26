@@ -14,20 +14,12 @@ Everything you decide becomes a **policy** that Citadel enforces with nftables.
 
 Citadel watches and asks without any extra software. To actually **block**
 traffic it needs **[citadel-helper](https://github.com/NeatOuk/citadel-helper)**,
-a small root helper that turns your policies into nftables rules. Install it once, either way:
+a small root helper that turns your policies into nftables rules. Build and install it once:
 
-- **From the AUR**, if you have no problem using it:
-
-  ```bash
-  yay -S citadel-helper        # or: paru -S citadel-helper
-  ```
-
-- **Without the AUR**, build it from its repository:
-
-  ```bash
-  git clone https://github.com/NeatOuk/citadel-helper.git
-  cd citadel-helper && makepkg -si
-  ```
+```bash
+git clone https://github.com/NeatOuk/citadel-helper.git
+cd citadel-helper && makepkg -si
+```
 
 Its README explains what runs as root and why it is safe. You can install it
 before or after the plugin; Citadel picks it up within a few seconds.
@@ -61,7 +53,7 @@ Citadel never edits your own configuration files. It only writes to `~/.local/sh
 | Notifications, clipboard import/export | `libnotify`, `wl-clipboard` | part of Omarchy |
 | Zone switching | `networkmanager` **or** `iwd` | wired links are detected either way; with neither, pick zones by hand |
 | Countries | `python-maxminddb` | optional; the database downloads from Settings |
-| Enforcement | [`citadel-helper`](https://github.com/NeatOuk/citadel-helper) (AUR or `makepkg`) → `nftables`, `polkit` | kernel with `nft_socket`, cgroup v2 and `INET_DIAG_DESTROY` (stock Arch has all three) |
+| Enforcement | [`citadel-helper`](https://github.com/NeatOuk/citadel-helper) (built with `makepkg`) → `nftables`, `polkit` | kernel with `nft_socket`, cgroup v2 and `INET_DIAG_DESTROY` (stock Arch has all three) |
 | Password-free enforcement | membership in `wheel` | otherwise polkit asks for an admin password each time |
 
 ## At a glance
@@ -129,7 +121,7 @@ Citadel uses [citadel-helper](https://github.com/NeatOuk/citadel-helper). See
 
 Remove it with `sudo pacman -R citadel-helper`. That also switches enforcement off.
 
-The helper's own [README](https://github.com/NeatOuk/citadel-helper#readme) covers its security model, commands and AUR releases.
+The helper's own [README](https://github.com/NeatOuk/citadel-helper#readme) covers its security model and commands.
 
 Blocking is per app, not per address. nftables matches the app's own systemd scope (`socket cgroupv2`), so "block Chromium" stops Chromium while other apps can still reach the same server. Blocking a host also ends its live connections (`ss -K`).
 

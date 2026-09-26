@@ -91,7 +91,7 @@ Column {
     wrapMode: Text.WordWrap
     maximumLineCount: 4
     font.pixelSize: Style.font.caption
-    text: "Blocking needs citadel-helper. Install it from the AUR (yay -S citadel-helper) or build it:\n"
+    text: "Blocking needs citadel-helper. Build and install it once:\n"
           + "git clone https://github.com/NeatOuk/citadel-helper.git && cd citadel-helper && makepkg -si"
   }
 
