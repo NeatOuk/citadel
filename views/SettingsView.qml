@@ -95,6 +95,21 @@ Column {
           + "git clone https://github.com/NeatOuk/citadel-helper.git && cd citadel-helper && makepkg -si"
   }
 
+  Toggle {
+    width: parent.width
+    label: "Catch short connections"
+    description: root.s.prefs.catchShort === false ? "Off: connections that end within a second may go unseen."
+      : !root.s.enforce ? "Needs enforcement on. The helper then logs each new connection so none slip past."
+      : !root.s.helperSupportsShort ? "Needs citadel-helper 1.2 or newer (installed: " + (root.s.helperVersion || "unknown") + ")."
+      : root.s.kernelLog.error ? "Kernel log unavailable: " + root.s.kernelLog.error
+      : root.s.helperLogging ? "On: " + root.s.kernelLog.seen + " new connections seen since start. Logged rate-limited to the kernel log."
+      : "Turning on…"
+    checked: root.s.prefs.catchShort !== false
+    foreground: root.p.foreground
+    fontFamily: root.p.fontFamily
+    onClicked: root.s.setPref("catchShort", root.s.prefs.catchShort === false)
+  }
+
   // ---------------------------------------------------------------- mode
   PanelSeparator { foreground: root.p.foreground }
   PanelSectionHeader { text: "OPEN AND LOCKDOWN"; foreground: root.p.foreground; fontFamily: root.p.fontFamily }

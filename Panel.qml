@@ -92,7 +92,9 @@ Panel {
                               monitorUp: citadel.monitorUp, helperInstalled: citadel.helperInstalled,
                               enforceError: citadel.enforceError, drops: citadel.enforceDrops,
                               omarchy: citadel.omarchyVersion, omarchySupported: citadel.omarchySupported,
-                              inWheel: citadel.inWheel, networkSource: citadel.network.source || "" })
+                              inWheel: citadel.inWheel, networkSource: citadel.network.source || "",
+                              helperVersion: citadel.helperVersion, helperLogging: citadel.helperLogging,
+                              kernelLog: citadel.kernelLog, recentShort: citadel.recentShort.length })
     }
   }
 

@@ -36,7 +36,7 @@ Item {
   property var lists: []
   property var decisionLog: []
   property var prefs: ({ interval: 2, alertTimeout: 90, alertDefault: "allow",
-                         retentionDays: 30, notify: true, modeMinutes: 0 })
+                         retentionDays: 30, notify: true, modeMinutes: 0, catchShort: true })
   property bool loaded: false
 
   readonly property var defaultLists: [
@@ -64,6 +64,11 @@ Item {
   property var ipCidrs: []
   property var geoip: ({ installed: false, error: "" })
   property var approx: ({})
+  property var recentShort: []              // short connections the poll missed (newest first)
+  property var kernelLog: ({ running: false, error: "", seen: 0 })
+  property string helperVersion: ""         // from `citadel-enforcer status` (1.2+)
+  property bool helperLogging: false
+  readonly property bool helperSupportsShort: helperVersion !== "" && Number(helperVersion.split(".")[1]) >= 2
   property var learned: ({})                // ruleId -> {ip: lastSeen}, see Model.learnTargets
   property var rate: ({ up: 0, down: 0 })
   property var totals: ({ connections: 0, apps: 0, denied: 0 })
@@ -198,7 +203,7 @@ Item {
     var alive = {}
     for (var exe in apps) (apps[exe].pids || []).forEach(function(p) { alive[p] = true })
     return { profile: activeProfile, mode: mode, resolved: resolved, alivePids: alive, session: session,
-             learned: Model.learnedIps(learned) }
+             learned: Model.learnedIps(learned), learnedCg: Model.learnedCgroups(learned) }
   }
 
   function _onTick(m) {
@@ -207,6 +212,7 @@ Item {
     conns = m.conns || []
     apps = m.apps || {}
     network = m.network || { names: [], ssid: "" }
+    if (m.kernelLog) kernelLog = m.kernelLog
     var first = ticks === 0
     ticks++
     _pruneExpiredRules()
@@ -238,9 +244,42 @@ Item {
     groups = Model.groupByApp(conns, dec)
     rate = { up: up, down: down }
     totals = { connections: conns.length, apps: groups.length, denied: denied }
+    // connections that ended before the poll saw them (kernel log, helper 1.2+)
+    var shorts = m.short || []
+    if (shorts.length) {
+      var recent = []
+      for (var k = 0; k < shorts.length; k++) {
+        var sc = shorts[k]
+        var sd = Model.decide(sc, rules, ctx)
+        recent.push({ conn: sc, decision: sd })
+        if (first) continue
+        var trusted = sc.confidence === "matched" || sc.confidence === "likely"
+        if (sd.verdict === "prompt" && trusted) _queueAlert(newAlerts, sc, sd)
+        else if (sd.source === "silent" || sd.source === "blocklist")
+          logged.push(_logEntry(sc, sd.verdict, sd.source === "blocklist" ? "feed " + (sc.list || "") : (mode === "open" ? "open mode" : "lockdown")))
+      }
+      // merge repeats of the same app + launcher + destination within a minute
+      var merged = recentShort.slice()
+      recent.reverse().forEach(function(item) {
+        var c = item.conn
+        for (var r = 0; r < merged.length; r++) {
+          var o = merged[r].conn
+          if (o.exe === c.exe && (o.viaId || "") === (c.viaId || "") && o.raddr === c.raddr
+              && o.rport === c.rport && c.ts - o.ts < 60) {
+            merged[r] = { conn: c, decision: item.decision, count: (merged[r].count || 1) + 1 }
+            merged.unshift(merged.splice(r, 1)[0])
+            return
+          }
+        }
+        merged.unshift({ conn: c, decision: item.decision, count: 1 })
+      })
+      recentShort = merged.slice(0, 60)
+    }
     if (newAlerts.length !== alerts.length) alerts = newAlerts
     if (logged.length) _log(logged)
-    if (enforce) _syncEnforcement(false)
+    // first tick after a start or plugin reload: the uid is known now, so
+    // re-apply for sure (the load-time sync may have run before it was)
+    if (enforce) _syncEnforcement(first)
   }
 
   // ------------------------------------------------- alerts
@@ -248,14 +287,15 @@ Item {
     var key = Model.alertKey(conn)
     for (var i = 0; i < queue.length; i++) if (queue[i].key === key) return
     var info = apps[conn.exe] || null
-    queue.push({ key: key, conn: conn, firstSeen: now, changed: d.source === "changed",
+    queue.push({ key: key, conn: conn, firstSeen: now, changed: d.source === "changed", short: !!conn.short,
                  trust: info ? info.trust : { level: "unknown" }, hasOwnScope: !!(info && info.owned && info.owned.length) })
     if (prefs.notify !== false) _notify(conn, d.source === "changed")
   }
 
   // Answer the oldest (or given) alert.
   // action: allow|deny ; scope: hostPort|host|app ; duration: once|untilQuit|forever
-  function answer(key, action, scope, duration, source) {
+  // viaScoped: the policy only covers the app when started by the same launcher
+  function answer(key, action, scope, duration, source, viaScoped) {
     var alert = null
     for (var i = 0; i < alerts.length; i++) if (alerts[i].key === key) { alert = alerts[i]; break }
     if (!alert) return
@@ -267,12 +307,13 @@ Item {
       var info = apps[alert.conn.exe] || null
       // replace a stale rule for a changed binary
       if (alert.changed) rules = rules.filter(function(r) { return !(r.app === alert.conn.exe && r.exeHash) })
-      addRule(Model.ruleFromAlert(alert, action, scope, duration, "*", info), true)
+      addRule(Model.ruleFromAlert(alert, action, scope, duration, "*", info, viaScoped === true), true)
     }
     if (action === "deny") {
-      var exe = alert.conn.exe, dest = alert.conn.raddr, port = alert.conn.rport
+      var exe = alert.conn.exe, dest = alert.conn.raddr, port = alert.conn.rport, viaId = alert.conn.viaId || ""
       _kill(Model.killTargets(conns, function(c) {
         if (c.exe !== exe) return false
+        if (viaScoped === true && (c.viaId || "") !== viaId) return false
         if (scope === "app") return true
         if (scope === "hostPort" && c.rport !== port) return false
         return c.raddr === dest || (alert.conn.host && c.host === alert.conn.host)
@@ -305,7 +346,7 @@ Item {
     onExited: if (String(notifyOut.text || "").indexOf("default") !== -1) root.openRequested("gate") }
   function _notify(conn, changed) {
     var title = changed ? "Changed app at the gate" : "At the gate"
-    var body = Model.appLabel(conn) + " → " + Model.destLabel(conn) + ":" + conn.rport
+    var body = Model.appWithOrigin(conn) + " → " + Model.destLabel(conn) + ":" + conn.rport
     var cmd = ["notify-send", "-a", "Citadel", title, body]
     if (notifyProc.running) { Quickshell.execDetached(cmd); return }
     notifyProc.command = cmd.slice(0, 1).concat(["-A", "default=Decide", "-w"], cmd.slice(1))
@@ -314,7 +355,7 @@ Item {
 
   // ------------------------------------------------- decision log
   function _logEntry(conn, verdict, source) {
-    return { ts: now, app: Model.appLabel(conn), exe: conn.exe || "", dest: Model.destLabel(conn),
+    return { ts: now, app: Model.appWithOrigin(conn), exe: conn.exe || "", via: conn.viaId || "", dest: Model.destLabel(conn),
              ip: conn.raddr, port: conn.rport, cc: conn.cc || "", verdict: verdict, source: source }
   }
   function _log(entries) {
@@ -328,7 +369,7 @@ Item {
     var r = Model.makeRule(rule)
     // same match fields -> replace
     rules = rules.filter(function(x) {
-      return !(x.profile === r.profile && x.app === r.app && x.host === r.host && x.port === r.port)
+      return !(x.profile === r.profile && x.app === r.app && (x.via || "*") === r.via && x.host === r.host && x.port === r.port)
     }).concat([r])
     if (!fromAlert && r.action === "deny") {
       var ctx = _ctx()
@@ -356,10 +397,10 @@ Item {
     if (keep.length !== rules.length) { rules = keep; save() }
   }
   // quick actions from the monitor view
-  function allowApp(exe) { addRule({ app: exe, action: "allow" }) }
-  function denyApp(exe) { addRule({ app: exe, action: "deny" }) }
-  function denyConn(conn) { addRule({ app: conn.exe || "*", host: conn.host || conn.raddr, action: "deny" }) }
-  function allowConn(conn) { addRule({ app: conn.exe || "*", host: conn.host || conn.raddr, action: "allow" }) }
+  function allowApp(exe, viaId) { addRule({ app: exe, via: viaId || "*", action: "allow" }) }
+  function denyApp(exe, viaId) { addRule({ app: exe, via: viaId || "*", action: "deny" }) }
+  function denyConn(conn) { addRule({ app: conn.exe || "*", via: conn.viaId || "*", host: conn.host || conn.raddr, action: "deny" }) }
+  function allowConn(conn) { addRule({ app: conn.exe || "*", via: conn.viaId || "*", host: conn.host || conn.raddr, action: "allow" }) }
 
   function exportRules() { return JSON.stringify({ version: 2, rules: rules }, null, 2) }
   function importRules(text) {
@@ -434,6 +475,7 @@ Item {
     prefs = p
     save()
     if (key === "interval" || key === "retentionDays") _sendConfig()
+    if (key === "catchShort" && enforce) _syncEnforcement(true)
   }
 
   // ------------------------------------------------- blocklists + geoip
@@ -511,6 +553,7 @@ Item {
         root.enforceActive = true
         root.enforceError = ""
         root.enforceAppliedAt = Date.now() / 1000
+        if (root.helperVersion === "") root.refreshEnforceStatus()
       } else {
         root.enforceActive = false
         root._lastSpec = ""
@@ -544,6 +587,7 @@ Item {
   function _doSync() {
     if (!enforce || !helperInstalled || uid < 0) return
     var res = Model.buildSpec(rules, _ctx(), conns, apps, ipCidrs, uid)
+    res.spec.logNew = prefs.catchShort !== false        // ignored by helpers older than 1.2
     approx = res.approx
     var text = JSON.stringify(res.spec)
     if (text === _lastSpec && !_forceSync) return
@@ -586,6 +630,8 @@ Item {
         var s = JSON.parse(out)
         root.enforceActive = !!s.active
         root.enforceDrops = Number(s.drops) || 0
+        root.helperVersion = s.version || "1.1"
+        root.helperLogging = !!s.logging
       } catch (e) {}
     })
   }

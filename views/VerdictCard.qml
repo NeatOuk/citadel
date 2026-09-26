@@ -14,16 +14,22 @@ Column {
   property bool adjusting: false
   property string scope: "host"            // hostPort | host | app
   property string duration: "forever"      // forever | untilQuit
+  // cover the app only when started by the same launcher (script / program)
+  property bool viaScoped: viaDefault
 
   readonly property var conn: alert ? alert.conn : ({})
   readonly property var tr: alert ? (alert.trust || {}) : ({})
   readonly property int remaining: alert && s && Number(s.prefs.alertTimeout) > 0
     ? Math.max(0, Math.round(Number(s.prefs.alertTimeout) - (s.now - alert.firstSeen))) : -1
-  readonly property string scopeText: scope === "app" ? "every host"
-    : scope === "hostPort" ? Model.destLabel(conn) + " on port " + conn.rport : Model.destLabel(conn)
+  readonly property bool hasVia: !!(conn && conn.via)
+  // a launcher worth scoping to: scripts and programs, not "you, in a terminal"
+  readonly property bool viaDefault: hasVia && conn.viaKind !== "terminal"
+  readonly property string scopeText: (hasVia && viaScoped ? Model.appLabel(conn) + " " + Model.originLabel(conn) + ": " : "")
+    + (scope === "app" ? "every host"
+       : scope === "hostPort" ? Model.destLabel(conn) + " on port " + conn.rport : Model.destLabel(conn))
 
   spacing: Style.space(6)
-  onAlertChanged: { adjusting = false; scope = "host"; duration = "forever" }
+  onAlertChanged: { adjusting = false; scope = "host"; duration = "forever"; viaScoped = viaDefault }
 
   function integrity(t) {
     var l = t.level || "unknown"
@@ -34,7 +40,7 @@ Column {
     return { text: "integrity: unknown", bad: false, warn: true }
   }
   function verdict(action, duration) {
-    s.answer(alert.key, action, scope, duration)
+    s.answer(alert.key, action, scope, duration, "", hasVia && viaScoped)
   }
 
   // who
@@ -59,8 +65,28 @@ Column {
   Lbl {
     p: root.p
     width: parent.width
+    visible: root.hasVia
+    text: Model.originLabel(root.conn)
+          + (root.conn.viaKind === "script" ? "  (script)" : root.conn.viaKind === "terminal" ? "  (you, in a terminal)" : "")
+    font.pixelSize: Style.font.bodySmall
+    elide: Text.ElideMiddle
+  }
+  Lbl {
+    p: root.p
+    width: parent.width
     dim: true
-    text: root.conn.exe || "(system process)"
+    text: root.conn.cmd || root.conn.exe || "(system process)"
+    font.pixelSize: Style.font.caption
+    elide: Text.ElideRight          // middle-elide does not work on wrapped text
+    maximumLineCount: 2
+    wrapMode: Text.WrapAnywhere
+  }
+  Lbl {
+    p: root.p
+    width: parent.width
+    visible: root.adjusting && (root.conn.chain || []).length > 1
+    dim: true
+    text: "chain: " + [Model.appLabel(root.conn)].concat(root.conn.chain || []).join(" ← ")
     font.pixelSize: Style.font.caption
     elide: Text.ElideMiddle
   }
@@ -72,6 +98,18 @@ Column {
     text: "Its program changed since you let it through. Make sure the update is expected."
     wrapMode: Text.WordWrap
     maximumLineCount: 3
+  }
+
+  Lbl {
+    p: root.p
+    width: parent.width
+    visible: !!root.conn.short
+    dim: true
+    wrapMode: Text.WordWrap
+    maximumLineCount: 3
+    font.pixelSize: Style.font.caption
+    text: "This connection already finished; your verdict applies from the next one."
+          + (root.conn.confidence === "likely" ? " Matched by timing, so check the app is right." : "")
   }
 
   // where
@@ -175,6 +213,17 @@ Column {
       fontFamily: root.p.fontFamily
       fontSize: Style.font.caption
       onChanged: function(v) { root.scope = v }
+    }
+    Lbl { p: root.p; dim: true; visible: root.hasVia; text: "Started by"; font.pixelSize: Style.font.caption }
+    ButtonGroup {
+      visible: root.hasVia
+      options: [{ value: "via", label: "Only " + (root.conn.viaKind === "terminal" ? "in " : "via ") + (root.conn.via || "") },
+                { value: "any", label: "However it starts" }]
+      value: root.viaScoped ? "via" : "any"
+      foreground: root.p.foreground
+      fontFamily: root.p.fontFamily
+      fontSize: Style.font.caption
+      onChanged: function(v) { root.viaScoped = v === "via" }
     }
     Lbl { p: root.p; dim: true; text: "Lasts"; font.pixelSize: Style.font.caption }
     ButtonGroup {

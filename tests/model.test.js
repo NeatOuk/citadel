@@ -85,6 +85,31 @@ eq("learned kept", M.learnedIps(L), { h1: ["1.2.3.4"] })
 eq("learned in spec", M.buildSpec([hr], ctx({ learned: M.learnedIps(L) }), [], {}, [], 1000).spec.rules[0].targets, [{ ip: "1.2.3.4", port: null }])
 eq("learned expires", M.learnedIps(M.learnTargets(L, [hr], [], 5000, 3600)), {})
 
+// origin ("via")
+const SPEED = "/usr/share/omarchy/bin/omarchy-network-speedtest"
+const CURLC = (o) => conn(Object.assign({ exe: CURL, app: "curl", host: "x.nflxvideo.net", raddr: "23.246.54.150",
+  cgroup: CGT, via: "omarchy-network-speedtest", viaId: SPEED, viaKind: "script" }, o))
+const viaAllow = M.makeRule({ app: CURL, via: SPEED, action: "allow" })
+eq("via rule matches its launcher", M.decide(CURLC(), [viaAllow], ctx()).verdict, "allow")
+eq("via rule ignores other launchers", M.decide(CURLC({ viaId: "/home/me/other.sh", via: "other.sh" }), [viaAllow], ctx()).verdict, "prompt")
+eq("via beats plain app rule", M.decide(CURLC(), [M.makeRule({ app: CURL, action: "deny" }), viaAllow], ctx()).verdict, "allow")
+eq("alert key splits launchers", M.alertKey(CURLC()) !== M.alertKey(CURLC({ viaId: "/x/y" })), true)
+eq("ruleFromAlert via scoped", M.ruleFromAlert({ conn: CURLC() }, "allow", "host", "forever", "*", null, true).via, SPEED)
+eq("ruleFromAlert any launcher", M.ruleFromAlert({ conn: CURLC() }, "allow", "host", "forever", "*", null, false).via, "*")
+const viaDeny = M.makeRule({ id: "v1", app: CURL, via: SPEED, action: "deny" })
+const vs = M.buildSpec([viaDeny], ctx(), [CURLC()], {}, [], 1000)
+const firstCg = (spec) => spec.rules.filter(e => e.cgroup)[0]
+eq("via rule enforced per destination in launcher cgroup", firstCg(vs.spec), { verdict: "drop", cgroup: CGT, targets: [{ ip: "23.246.54.150", port: null }] })
+eq("via rule marked approximate", vs.approx.v1, true)
+const LV = M.learnTargets({}, [viaDeny], [CURLC()], 1000, 3600)
+eq("learned via cgroup", M.learnedCgroups(LV).v1, [CGT])
+eq("learned via ip", M.learnedIps(LV).v1, ["23.246.54.150"])
+const vs2 = M.buildSpec([viaDeny], ctx({ learned: M.learnedIps(LV), learnedCg: M.learnedCgroups(LV) }), [], {}, [], 1000)
+eq("via rule survives after curl exits", (firstCg(vs2.spec) || {}).cgroup, CGT)
+eq("grouping splits launchers", M.groupByApp([CURLC(), CURLC({ viaId: "/x/y", via: "y" })], {}).length, 2)
+eq("origin label", M.originLabel(CURLC()), "via omarchy-network-speedtest")
+eq("terminal label", M.originLabel(CURLC({ via: "ghostty", viaKind: "terminal" })), "started in ghostty")
+
 // profiles
 const profiles = [{ name: "Home", networks: ["US"] }, { name: "Public", networks: ["Cafe WiFi"] }]
 eq("profile by ssid", M.activeProfile(profiles, "", ["Cafe WiFi"]), "Public")

@@ -46,6 +46,22 @@ function appLabel(conn) {
   return conn.app || (conn.exe ? conn.exe.split("/").pop() : "unknown")
 }
 
+// "via omarchy-network-speedtest" / "started in ghostty" / ""
+function originLabel(conn) {
+  if (!conn || !conn.via) return ""
+  return conn.viaKind === "terminal" ? "started in " + conn.via : "via " + conn.via
+}
+
+function appWithOrigin(conn) {
+  var o = conn && conn.via ? (conn.viaKind === "terminal" ? " in " : " via ") + conn.via : ""
+  return appLabel(conn) + o
+}
+
+function viaLabel(viaId) {
+  if (!viaId || viaId === "*") return ""
+  return String(viaId).split("/").pop()
+}
+
 function destLabel(conn) {
   return conn.host || conn.raddr || "?"
 }
@@ -116,7 +132,8 @@ function netContains(netStr, ip) {
 
 // ------------------------------------------------------------------ rules
 
-// A rule: { id, profile: "*"|name, app: "*"|exe, host: "*"|hostname|IP|CIDR,
+// A rule: { id, profile: "*"|name, app: "*"|exe, via: "*"|launcher id (script
+//           path or exe of the process that started the app), host: "*"|hostname|IP|CIDR,
 //           port: "*"|number, action: "allow"|"deny",
 //           duration: "forever"|"untilQuit", pids: [..] (untilQuit),
 //           exeHash, note, createdAt }
@@ -137,6 +154,7 @@ function makeRule(fields) {
     id: f.id || (Date.now().toString(36) + Math.random().toString(36).slice(2, 7)),
     profile: f.profile || "*",
     app: f.app || "*",
+    via: f.via || "*",
     host: normHost(f.host),
     port: normPort(f.port),
     action: f.action === "deny" ? "deny" : "allow",
@@ -155,6 +173,7 @@ function specificity(rule) {
   var host = rule.host && rule.host !== "*"
   var s = app && host ? 30 : host ? 20 : app ? 10 : 0
   if (rule.port !== "*" && rule.port !== undefined) s += 5
+  if (rule.via && rule.via !== "*") s += 3       // "curl, only when started by X"
   return s
 }
 
@@ -182,6 +201,7 @@ function ruleActive(rule, ctx) {
 function ruleMatches(rule, conn, ctx) {
   if (!ruleActive(rule, ctx)) return false
   if (rule.app && rule.app !== "*" && rule.app !== conn.exe) return false
+  if (rule.via && rule.via !== "*" && rule.via !== (conn.viaId || "")) return false
   if (rule.port !== "*" && rule.port !== undefined && Number(rule.port) !== Number(conn.rport)) return false
   return hostMatches(rule.host, conn, ctx.resolved)
 }
@@ -215,17 +235,18 @@ function decide(conn, rules, ctx) {
 
 // Alerts are per app + destination + port, not per socket.
 function alertKey(conn) {
-  return [conn.exe || conn.app || "?", normHost(conn.host) !== "*" ? normHost(conn.host) : conn.raddr,
-          conn.rport || 0].join("|")
+  return [conn.exe || conn.app || "?", conn.viaId || "",
+          normHost(conn.host) !== "*" ? normHost(conn.host) : conn.raddr, conn.rport || 0].join("|")
 }
 
 // Rule fields for an alert answer. scope: "hostPort" | "host" | "app"
-function ruleFromAlert(alert, action, scope, duration, profile, appInfo) {
+function ruleFromAlert(alert, action, scope, duration, profile, appInfo, viaScoped) {
   var conn = alert.conn
   var host = conn.host || conn.raddr
   return makeRule({
     profile: profile || "*",
     app: conn.exe || "*",
+    via: viaScoped && conn.viaId ? conn.viaId : "*",
     host: scope === "app" ? "*" : host,
     port: scope === "hostPort" ? conn.rport : "*",
     action: action,
@@ -279,14 +300,18 @@ function learnTargets(learned, rules, conns, now, ttl) {
     var r = rules[i]
     var named = r.host !== "*" && !isAddressLike(r.host)
     var wholeApp = r.app !== "*" && r.host === "*"
-    if (!named && !wholeApp) continue
+    var viaRule = r.via && r.via !== "*"
+    if (!named && !wholeApp && !viaRule) continue
     for (var j = 0; j < conns.length; j++) {
       var c = conns[j]
       if (c.system) continue
-      if (named ? hostMatches(r.host, c, null) : c.exe === r.app) {
-        if (!out[r.id]) out[r.id] = {}
-        out[r.id][c.raddr] = now
-      }
+      var hit
+      if (viaRule) hit = c.exe === r.app && (c.viaId || "") === r.via && hostMatches(r.host, c, null)
+      else hit = named ? hostMatches(r.host, c, null) : c.exe === r.app
+      if (!hit) continue
+      if (!out[r.id]) out[r.id] = {}
+      if (named || wholeApp) out[r.id][c.raddr] = now
+      if (viaRule && c.cgroup) out[r.id]["cg:" + c.cgroup] = now
     }
   }
   return out
@@ -294,7 +319,14 @@ function learnTargets(learned, rules, conns, now, ttl) {
 
 function learnedIps(learned) {
   var out = {}
-  for (var id in learned) out[id] = Object.keys(learned[id])
+  for (var id in learned) out[id] = Object.keys(learned[id]).filter(function(k) { return k.indexOf("cg:") !== 0 })
+  return out
+}
+
+function learnedCgroups(learned) {
+  var out = {}
+  for (var id in learned)
+    out[id] = Object.keys(learned[id]).filter(function(k) { return k.indexOf("cg:") === 0 }).map(function(k) { return k.slice(3) })
   return out
 }
 
@@ -326,6 +358,21 @@ function buildSpec(rules, ctx, conns, apps, blocklistCidrs, uid) {
     if (!hasApp) {
       var t = hostTargets(r, conns, ctx.resolved, ctx.learned)
       if (t.length) entries.push({ verdict: verdict, targets: t })
+      continue
+    }
+    if (r.via && r.via !== "*") {
+      // The launcher's cgroup also holds the launcher itself, so a "via" rule
+      // can only be enforced per destination inside that cgroup.
+      approx[r.id] = true
+      var cgs = uniq(conns.filter(function(c) { return !c.system && c.exe === r.app && (c.viaId || "") === r.via })
+        .map(function(c) { return c.cgroup })
+        .concat(ctx.learnedCg && ctx.learnedCg[r.id] ? ctx.learnedCg[r.id] : []))
+        .filter(function(c) { return userCgroup(c, uid) }).sort()
+      var vt = hasHost ? hostTargets(r, conns, ctx.resolved, ctx.learned)
+        : uniq(conns.filter(function(c) { return c.exe === r.app && (c.viaId || "") === r.via }).map(function(c) { return c.raddr })
+            .concat(ctx.learned && ctx.learned[r.id] ? ctx.learned[r.id] : [])).sort()
+            .map(function(ip) { return { ip: ip, port: r.port === "*" ? null : r.port } })
+      if (vt.length) for (var v = 0; v < cgs.length; v++) entries.push({ verdict: verdict, cgroup: cgs[v], targets: vt })
       continue
     }
     var info = apps ? apps[r.app] : null
@@ -395,8 +442,9 @@ function groupByApp(conns, decisions) {
   var by = {}
   for (var i = 0; i < conns.length; i++) {
     var c = conns[i]
-    var k = c.system ? "system:" + c.app : (c.exe || c.app)
+    var k = c.system ? "system:" + c.app : (c.exe || c.app) + (c.viaId ? "|" + c.viaId : "")
     var g = by[k] || { key: k, app: c.app, exe: c.exe, system: !!c.system, conns: [],
+                       via: c.via || "", viaId: c.viaId || "", viaKind: c.viaKind || "",
                        up: 0, down: 0, upRate: 0, downRate: 0, denied: 0, prompts: 0 }
     g.conns.push(c)
     g.up += c.up || 0; g.down += c.down || 0

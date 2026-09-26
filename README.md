@@ -108,6 +108,29 @@ Citadel never edits your own configuration files. It only writes to `~/.local/sh
 | **History** | Traffic over the last hour, top apps and hosts (today or 7 days), countries, and the log of verdicts. |
 | **Settings** | Enforcement, the timer for Open and Lockdown, **zones** (link Wi-Fi or wired networks and Citadel switches as you move), what happens to an unanswered request, notifications, refresh rate, history retention, and the country database. |
 
+**Who started it.** Tools like `curl`, `wget` or `git` are started by
+something else, so Citadel shows the **launcher** too:
+- `curl via omarchy-network-speedtest` for a script, or `claude in ghostty` when you started it in a terminal
+- the command line, with passwords, tokens, `Authorization` headers and request bodies masked
+- the full launch chain, under **Adjust**
+
+At the gate, a verdict can cover the app **only when started by that
+launcher**, so allowing curl for your speed test doesn't allow curl for everything.
+
+**Short connections.** Many tool connections last less than a second, too short
+to catch between two checks. With enforcement on and citadel-helper 1.2 or
+newer, the helper logs each new connection from your apps to the kernel log
+(rate-limited). Citadel reads it live and matches the connection to the process
+that made it. Traffic shows these under **Just now**, each with a label saying
+how sure the match is:
+- **matched:** the command, or its launcher script, names that host
+- **likely:** matched by timing
+- **app unclear**
+
+Only matched or likely connections are sent to the gate. The log lines are also
+kept in your system journal like any kernel message. Turn this off under
+**Settings → Catch short connections**.
+
 **Integrity** stands in for code signing. Each program is checked against the sha256 that pacman recorded for its package. The levels are **verified**, **modified**, **not packaged** and **suspicious** (runs from `/tmp`, or deleted). If a program you allowed changes without a package update, it comes back to the gate.
 
 ## Enforcement
@@ -134,7 +157,7 @@ What the firewall never touches:
 ## Good to know
 
 - **The first packet may leave.** Citadel sees a new connection within one refresh, and a moment before it answers the gate. Every later attempt follows your verdict.
-- **Very short connections** can slip between refreshes. Set the refresh to 1 s to catch more.
+- **Very short connections** are caught through the kernel log when *Catch short connections* is on (helper 1.2+). Without it they can slip between refreshes.
 - **Command-line tools inside a terminal** share the terminal's scope, so their policies are enforced per destination within that scope. The policy is marked this way.
 - **Blocking an interpreter** (e.g. `python3.14`) blocks every program running on it.
 - **Host names come from reverse DNS.** CDNs may show their own names, and domain feeds only match names Citadel knows.

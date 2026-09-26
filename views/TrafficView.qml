@@ -90,6 +90,7 @@ Column {
         var rs = root.s.rules
         for (var i = 0; i < rs.length; i++)
           if (rs[i].app === modelData.exe && rs[i].host === "*" && rs[i].port === "*"
+              && (rs[i].via || "*") === (modelData.viaId || "*")
               && (rs[i].profile === "*" || rs[i].profile === root.s.activeProfile)) return rs[i]
         return null
       }
@@ -120,6 +121,7 @@ Column {
             p: root.p
             Layout.fillWidth: true
             text: (grp.open ? "▾ " : "▸ ") + grp.modelData.app
+                  + (grp.modelData.via ? (grp.modelData.viaKind === "terminal" ? "  in " : "  via ") + grp.modelData.via : "")
                   + (grp.modelData.system ? "  (system)" : "")
             strong: true
           }
@@ -135,7 +137,7 @@ Column {
             visible: !grp.modelData.system && !!grp.modelData.exe
             text: grp.appRule && grp.appRule.action === "allow" ? "Allowed ✓" : "Allow app"
             onClicked: grp.appRule && grp.appRule.action === "allow"
-              ? root.s.removeRule(grp.appRule.id) : root.s.allowApp(grp.modelData.exe)
+              ? root.s.removeRule(grp.appRule.id) : root.s.allowApp(grp.modelData.exe, grp.modelData.viaId)
           }
           LinkButton {
             p: root.p
@@ -143,7 +145,7 @@ Column {
             visible: !grp.modelData.system && !!grp.modelData.exe
             text: grp.appRule && grp.appRule.action === "deny" ? "Blocked ✕" : "Block app"
             onClicked: grp.appRule && grp.appRule.action === "deny"
-              ? root.s.removeRule(grp.appRule.id) : root.s.denyApp(grp.modelData.exe)
+              ? root.s.removeRule(grp.appRule.id) : root.s.denyApp(grp.modelData.exe, grp.modelData.viaId)
           }
         }
       }
@@ -193,6 +195,15 @@ Column {
                     + " · ↓" + Model.humanBytes(modelData.down) + " ↑" + Model.humanBytes(modelData.up)
                     + " · " + root.statusText(parent.parent.d)
             }
+            Lbl {
+              p: root.p
+              width: parent.width
+              visible: !!modelData.cmd && !!grp.modelData.viaId
+              dim: true
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideMiddle
+              text: "$ " + modelData.cmd
+            }
           }
           LinkButton {
             p: root.p
@@ -208,6 +219,75 @@ Column {
             onClicked: root.s.denyConn(modelData)
           }
         }
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------- just now
+  // Connections that started and ended between two polls, caught through the
+  // kernel log (citadel-helper 1.2+ with "Catch short connections" on).
+  PanelSeparator { visible: root.s.recentShort.length > 0; foreground: root.p.foreground }
+  RowLayout {
+    width: parent.width
+    visible: root.s.recentShort.length > 0
+    PanelSectionHeader { text: "JUST NOW · SHORT CONNECTIONS"; foreground: root.p.foreground; fontFamily: root.p.fontFamily; Layout.fillWidth: true }
+    Lbl { p: root.p; dim: true; text: root.s.recentShort.length + " caught"; font.pixelSize: Style.font.caption }
+  }
+  Repeater {
+    model: root.s.recentShort.slice(0, 12)
+    delegate: RowLayout {
+      required property var modelData
+      readonly property var c: modelData.conn
+      width: root.width
+      spacing: Style.space(6)
+      Rectangle {
+        width: Style.space(5); height: width; radius: width / 2
+        color: root.statusColor(modelData.decision)
+      }
+      Column {
+        Layout.fillWidth: true
+        spacing: 0
+        Lbl {
+          p: root.p
+          width: parent.width
+          text: Model.appWithOrigin(parent.parent.c) + "  →  " + (parent.parent.c.cc ? Model.flag(parent.parent.c.cc) + " " : "")
+                + Model.destLabel(parent.parent.c) + ":" + parent.parent.c.rport
+          elide: Text.ElideMiddle
+        }
+        Lbl {
+          p: root.p
+          width: parent.width
+          dim: true
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+          text: Model.clock(parent.parent.c.ts) + " · " + parent.parent.c.proto.toUpperCase()
+                + " · " + (parent.parent.c.confidence === "matched" ? "matched by command"
+                           : parent.parent.c.confidence === "likely" ? "likely (timing)"
+                           : "app unclear" + (parent.parent.c.guess ? " (maybe " + parent.parent.c.guess + ")" : ""))
+                + " · " + root.statusText(modelData.decision)
+                + (parent.parent.c.cmd ? "  $ " + parent.parent.c.cmd : "")
+        }
+      }
+      Lbl {
+        p: root.p
+        visible: (modelData.count || 1) > 1
+        dim: true
+        text: "×" + modelData.count
+        font.pixelSize: Style.font.caption
+      }
+      // verdicts only when Citadel is confident which app it was
+      LinkButton {
+        p: root.p
+        visible: (parent.c.confidence === "matched" || parent.c.confidence === "likely") && !!parent.c.exe
+        text: "Allow"
+        onClicked: root.s.allowConn(parent.c)
+      }
+      LinkButton {
+        p: root.p
+        danger: true
+        visible: (parent.c.confidence === "matched" || parent.c.confidence === "likely") && !!parent.c.exe
+        text: "Block"
+        onClicked: root.s.denyConn(parent.c)
       }
     }
   }

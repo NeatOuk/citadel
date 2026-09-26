@@ -73,7 +73,7 @@ def split_addr(field):
         host, _, port = field[1:].partition("]:")
     else:
         host, _, port = field.rpartition(":")
-    host = host.split("%", 1)[0]          # 192.168.5.6%wlp0s20f3
+    host = host.split("%", 1)[0]          # 172.16.5.6%wlp0s20f3
     if host.startswith("::ffff:") and "." in host:
         host = host[7:]
     return host, (int(port) if port.isdigit() else 0)
@@ -682,6 +682,9 @@ class History:
             CREATE INDEX IF NOT EXISTS flows_start ON flows(start);
             CREATE TABLE IF NOT EXISTS samples (t INTEGER PRIMARY KEY, rx INTEGER, tx INTEGER);
         """)
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(flows)")}
+        if "via" not in cols:                       # added in 1.2
+            self.db.execute("ALTER TABLE flows ADD COLUMN via TEXT DEFAULT ''")
         self.ids = {}           # socket key -> row id
         self.last_prune = 0
 
@@ -693,11 +696,11 @@ class History:
             seen.add(k)
             rid = self.ids.get(k)
             if rid is None:
-                cur.execute("INSERT INTO flows(start,last,exe,comm,proto,raddr,rport,host,cc,up,down,system)"
-                            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                cur.execute("INSERT INTO flows(start,last,exe,comm,proto,raddr,rport,host,cc,up,down,system,via)"
+                            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                             (now, now, c.get("exe") or "", c.get("app") or "", c["proto"], c["raddr"],
                              c["rport"], c.get("host") or "", c.get("cc") or "", c["up"], c["down"],
-                             1 if c.get("system") else 0))
+                             1 if c.get("system") else 0, c.get("via") or ""))
                 self.ids[k] = cur.lastrowid
             else:
                 cur.execute("UPDATE flows SET last=?, up=?, down=?, host=COALESCE(NULLIF(?,''),host),"
@@ -713,6 +716,14 @@ class History:
             self.last_prune = now
         self.db.commit()
 
+    def record_short(self, items):
+        self.db.executemany(
+            "INSERT INTO flows(start,last,exe,comm,proto,raddr,rport,host,cc,up,down,system,via)"
+            " VALUES(?,?,?,?,?,?,?,?,?,0,0,0,?)",
+            [(c["ts"], c["ts"], c["exe"], c["app"], c["proto"], c["raddr"], c["rport"], c["host"],
+              c["cc"], c["via"]) for c in items])
+        self.db.commit()
+
     def sample(self, t, rx, tx):
         self.db.execute("INSERT OR REPLACE INTO samples(t,rx,tx) VALUES(?,?,?)", (t, rx, tx))
 
@@ -723,7 +734,7 @@ class History:
 
         def top(col, since, n=8):
             rows = q("SELECT %s, SUM(up), SUM(down), COUNT(*) FROM flows WHERE last >= ? AND system=0"
-                     " AND %s != '' GROUP BY %s ORDER BY SUM(up)+SUM(down) DESC LIMIT ?" % (col, col, col),
+                     " AND (%s) != '' GROUP BY %s ORDER BY SUM(up)+SUM(down) DESC LIMIT ?" % (col, col, col),
                      (since, n)).fetchall()
             return [{"name": r[0], "up": r[1] or 0, "down": r[2] or 0, "flows": r[3]} for r in rows]
 
@@ -741,12 +752,436 @@ class History:
         start = (int(now) // 60) * 60 - 59 * 60
         series = [{"t": start + i * 60, "down": buckets.get(start + i * 60, [0, 0])[0],
                    "up": buckets.get(start + i * 60, [0, 0])[1]} for i in range(60)]
+        app_col = "CASE WHEN COALESCE(via,'') != '' THEN comm || ' via ' || via ELSE comm END"
         emit({"type": "stats", "series": series,
-              "topAppsToday": top("comm", day0), "topHostsToday": top("COALESCE(NULLIF(host,''),raddr)", day0),
-              "countriesToday": top("cc", day0, 30), "topApps7d": top("comm", now - 7 * 86400)})
+              "topAppsToday": top(app_col, day0), "topHostsToday": top("COALESCE(NULLIF(host,''),raddr)", day0),
+              "countriesToday": top("cc", day0, 30), "topApps7d": top(app_col, now - 7 * 86400)})
 
 
 # ------------------------------------------------------------------ main loop
+
+# ------------------------------------------------------------------ origin
+# Who started a process and why: the parent chain, the first "meaningful"
+# ancestor (skipping shells and wrappers), the unit, and a masked command
+# line. Cached per (pid, start time) so pid reuse can't mix processes up.
+
+SHELLS = {"bash", "sh", "dash", "zsh", "fish", "ksh", "env", "xargs", "timeout",
+          "nohup", "setsid", "flock", "nice", "ionice", "stdbuf", "uwsm", "uwsm-app",
+          "systemd-run", "sudo", "doas", "pkexec", "script", "time", "exec", "chrt"}
+INTERPRETERS = {"bash", "sh", "dash", "zsh", "fish", "python", "python3", "node", "perl",
+                "ruby", "lua", "luajit", "deno", "bun", "php", "tclsh", "osascript"}
+TERMINALS = {"ghostty", "alacritty", "kitty", "foot", "wezterm", "wezterm-gui", "konsole",
+             "gnome-terminal-server", "xterm", "st", "tmux: server", "tmux", "zellij"}
+MANAGERS = {"systemd", "init"}
+SECRET_WORDS = r"(?:token|secret|passw(?:or)?d|pwd|auth|authorization|api[_-]?key|apikey|key|sig|signature|session|cookie|bearer|credential)"
+origin_cache = {}        # (pid, starttime) -> origin dict
+
+
+def proc_stat(pid):
+    """(comm, ppid, starttime) from /proc/<pid>/stat, or None."""
+    raw = read("/proc/%d/stat" % pid)
+    if not raw:
+        return None
+    lp, rp = raw.find("("), raw.rfind(")")
+    if lp < 0 or rp < 0:
+        return None
+    comm = raw[lp + 1:rp]
+    rest = raw[rp + 2:].split()
+    try:
+        return comm, int(rest[1]), int(rest[19])
+    except (IndexError, ValueError):
+        return None
+
+
+def proc_cmdline(pid):
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as f:
+            raw = f.read(8192)
+    except OSError:
+        return []
+    return [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
+
+
+def interp_name(base):
+    """python3.14 -> python3, node22 -> node"""
+    m = re.match(r"^([a-z]+?)(?:[0-9.]+)?$", base)
+    return m.group(1) if m else base
+
+
+def redact_args(args):
+    """Mask credentials in an argument vector (curl/wget/git style and URLs)."""
+    out = []
+    mask_next = None
+    for a in args:
+        if mask_next == "all":
+            out.append("***"); mask_next = None; continue
+        if mask_next == "header":
+            name, sep, _ = a.partition(":")
+            out.append(name + ": ***" if sep and re.search(SECRET_WORDS, name, re.I) else _redact_url(a))
+            mask_next = None; continue
+        if mask_next == "data":
+            out.append("<%d bytes>" % len(a)); mask_next = None; continue
+        if a in ("-u", "--user", "--proxy-user", "-E", "--cert", "--key", "--pass", "--oauth2-bearer",
+                 "--password", "--http-password", "--ftp-password", "--proxy-password"):
+            out.append(a); mask_next = "all"; continue
+        if a in ("-H", "--header", "--proxy-header"):
+            out.append(a); mask_next = "header"; continue
+        if a in ("-d", "--data", "--data-raw", "--data-binary", "--data-urlencode", "--json",
+                 "-F", "--form", "--post-data", "--body-data"):
+            out.append(a); mask_next = "data"; continue
+        m = re.match(r"^(--(?:user|password|http-password|header|data[a-z-]*|json|post-data|oauth2-bearer)=)(.*)$", a)
+        if m:
+            out.append(m.group(1) + ("<%d bytes>" % len(m.group(2)) if "data" in m.group(1) or "json" in m.group(1) else "***"))
+            continue
+        out.append(_redact_url(a))
+    return out
+
+
+def _redact_url(a):
+    # any user info in a URL (user:pass@ or a bare token@) is a credential
+    a = re.sub(r"(\b[a-z][a-z0-9+.-]*://)[^/\s@]+@", r"\1***@", a, flags=re.I)
+    # ?token=...&key=...
+    a = re.sub(r"([?&;][^=&\s]*" + SECRET_WORDS + r"[^=&\s]*=)[^&\s#]*", r"\1***", a, flags=re.I)
+    # KEY=secret env-style assignments
+    a = re.sub(r"^([A-Za-z_]*" + SECRET_WORDS + r"[A-Za-z_]*=).+$", r"\1***", a, flags=re.I)
+    return a
+
+
+def unit_name(cg):
+    """cgroup path -> readable unit: 'app-Hyprland-xdg\\x2dterminal\\x2dexec-79be.scope'."""
+    last = (cg or "").rstrip("/").rsplit("/", 1)[-1]
+    return last.replace("\\x2d", "-").replace("\\x40", "@")
+
+
+def describe(pid):
+    """-> {name, kind, exe, pid} for one process; interpreters running a
+    script are named after the script."""
+    st = proc_stat(pid)
+    if not st:
+        return None
+    comm, ppid, start = st
+    try:
+        exe = os.readlink("/proc/%d/exe" % pid).replace(" (deleted)", "")
+    except OSError:
+        exe = ""
+    base = os.path.basename(exe) or comm
+    args = proc_cmdline(pid)
+    kind, name, ident = "app", base, exe or comm
+    if interp_name(base) in INTERPRETERS and len(args) > 1:
+        # first non-option argument is the script (skip "-u", "-c <code>" etc.)
+        script = ""
+        i = 1
+        while i < len(args):
+            a = args[i]
+            if a == "-c" or a == "-e":
+                break                    # inline code: no script file
+            if a in ("-m",) and i + 1 < len(args):
+                script = args[i + 1]; break
+            if not a.startswith("-"):
+                script = a; break
+            i += 1
+        if script:
+            kind, name, ident = "script", os.path.basename(script), script if script.startswith("/") else name
+    if comm in TERMINALS or base in TERMINALS:
+        kind = "terminal"
+    return {"pid": pid, "ppid": ppid, "start": start, "comm": comm, "exe": exe,
+            "name": name, "kind": kind, "id": ident, "args": args}
+
+
+def origin(pid, cg=""):
+    """Launch chain and responsible ancestor for a process of this user."""
+    st = proc_stat(pid)
+    if not st:
+        return None
+    key = (pid, st[2])
+    hit = origin_cache.get(key)
+    if hit is not None:
+        return hit
+    me = describe(pid)
+    if not me:
+        return None
+    chain, via = [], None
+    cur = me["ppid"]
+    for _ in range(12):
+        if cur <= 1:
+            break
+        d = describe(cur)
+        if not d:
+            break
+        if d["comm"] in MANAGERS or d["exe"].endswith("/systemd"):
+            break
+        chain.append(d["name"])
+        if via is None and not (d["comm"] in SHELLS and d["kind"] != "script") \
+                and not (interp_name(d["comm"]) in INTERPRETERS and d["kind"] != "script"):
+            via = d
+        if d["kind"] == "terminal":
+            break                        # started by you in a terminal
+        cur = d["ppid"]
+    cmd = " ".join(redact_args(me["args"]))[:400]
+    out = {"cmd": cmd, "chain": chain[:8], "unit": unit_name(cg),
+           "via": None if not via else {"name": via["name"], "kind": via["kind"], "id": via["id"]}}
+    # the same program started by itself (chromium helpers) has no "via"
+    if via and (via["id"] == me["id"] or via["name"] == me["name"]):
+        out["via"] = None
+    origin_cache[key] = out
+    if len(origin_cache) > 4000:
+        for k in list(origin_cache)[:1000]:
+            del origin_cache[k]
+    return out
+
+
+# ------------------------------------------------------------------ short-lived connections
+# With citadel-helper >= 1.2 and enforcement on, the kernel logs every new
+# outbound connection from this user ("citadel: ... SRC= DST= SPT= DPT=").
+# A connection whose socket is already gone at the next poll is matched to
+# a process seen by the fast process watcher below.
+
+kev_lock = threading.Lock()
+kernel_events = []           # parsed log lines waiting for correlation
+kernel_state = {"running": False, "error": "", "seen": 0}
+KV = re.compile(r"\b([A-Z]+)=(\S*)")
+
+
+def kernel_log_reader():
+    """Follow the kernel log for Citadel's connection lines (needs journal
+    read access, which wheel members have on Arch)."""
+    while True:
+        try:
+            p = subprocess.Popen(["journalctl", "-k", "-f", "-n", "0", "-o", "short-unix", "--no-hostname"],
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        except OSError as e:
+            kernel_state.update(running=False, error="journalctl unavailable: %s" % e)
+            return
+        kernel_state.update(running=True, error="")
+        for line in p.stdout:
+            i = line.find("citadel: ")
+            if i < 0:
+                continue
+            f = dict(KV.findall(line[i:]))
+            try:
+                ev = {"ts": float(line.split(None, 1)[0]), "proto": f.get("PROTO", "").lower(),
+                      "src": f.get("SRC", ""), "dst": f.get("DST", ""),
+                      "spt": int(f.get("SPT") or 0), "dpt": int(f.get("DPT") or 0),
+                      "uid": int(f.get("UID") or -1)}
+            except ValueError:
+                continue
+            if ev["uid"] != MY_UID or not ev["dst"] or ev["proto"] not in ("tcp", "udp"):
+                continue
+            with kev_lock:
+                kernel_events.append(ev)
+                if len(kernel_events) > 2000:
+                    del kernel_events[:500]
+            kernel_state["seen"] += 1
+        kernel_state.update(running=False, error="kernel log reader stopped")
+        time.sleep(5)
+
+
+proc_seen = {}               # pid -> record (kept ~3 min after exit)
+proc_lock = threading.Lock()
+CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+
+
+def boot_time():
+    for line in read("/proc/stat").splitlines():
+        if line.startswith("btime "):
+            return float(line.split()[1])
+    return time.time() - time.monotonic()
+
+
+BOOT = boot_time()
+
+
+def process_watcher():
+    """Every 50 ms, remember new processes of this user with their origin,
+    so a connection can still be attributed after the process exits."""
+    known = set()
+    while True:
+        try:
+            pids = {int(d) for d in os.listdir("/proc") if d.isdigit()}
+        except OSError:
+            time.sleep(1)
+            continue
+        now = time.time()
+        for pid in pids - known:
+            try:
+                if os.stat("/proc/%d" % pid).st_uid != MY_UID:
+                    continue
+            except OSError:
+                continue
+            d = describe(pid)
+            if not d:
+                continue
+            cg = read("/proc/%d/cgroup" % pid).strip()
+            cg = cg.split("::", 1)[1].lstrip("/") if "::" in cg else ""
+            o = origin(pid, cg) or {}
+            # exact start from /proc/<pid>/stat, not the moment this scan saw it
+            started = BOOT + d["start"] / float(CLK_TCK)
+            rec = {"pid": pid, "ppid": d["ppid"], "start": min(now, started), "end": None, "exe": d["exe"],
+                   "comm": d["comm"], "name": d["name"], "kind": d["kind"], "cgroup": cg, "args": d["args"],
+                   "origin": o, "hosts": hosts_in_args(d["args"]),
+                   "scriptHosts": script_hosts(d["id"]) if d["kind"] == "script" else []}
+            with proc_lock:
+                proc_seen[pid] = rec
+        with proc_lock:
+            for pid in known - pids:
+                r = proc_seen.get(pid)
+                if r and r["end"] is None:
+                    r["end"] = now
+            for pid in [p for p, r in proc_seen.items() if r["end"] and now - r["end"] > 180]:
+                del proc_seen[pid]
+        known = pids
+        time.sleep(0.05)          # a scan costs ~0.1 ms, so 20/s is ~0.2% of a core
+
+
+HOST_ARG = re.compile(r"^(?:[a-z][a-z0-9+.-]*://)?(?:[^/@\s]+@)?(\[[0-9a-f:]+\]|[a-z0-9.-]+\.[a-z]{2,}|\d{1,3}(?:\.\d{1,3}){3})(?::\d+)?(?:[/?#].*)?$", re.I)
+
+
+def hosts_in_args(args):
+    """Host names / IPs mentioned in a command line (URLs, host:port, user@host)."""
+    out = []
+    for a in args[1:]:
+        if a.startswith("-") or len(a) > 2048:
+            continue
+        m = HOST_ARG.match(a.strip())
+        if m:
+            h = m.group(1).strip("[]").lower()
+            if h not in out:
+                out.append(h)
+    return out[:8]
+
+
+URL_IN_TEXT = re.compile(r"\b(?:https?|wss?|ftp)://(?:[^/@\s\"']+@)?([a-z0-9.-]+\.[a-z]{2,}|\d{1,3}(?:\.\d{1,3}){3})", re.I)
+script_host_cache = {}
+
+
+def script_hosts(path):
+    """Hosts named in a launcher script's own text (first 64 KB, cached by mtime)."""
+    if not path or not path.startswith("/"):
+        return []
+    try:
+        st = os.stat(path)
+        key = (path, st.st_mtime_ns)
+        if key in script_host_cache:
+            return script_host_cache[key]
+        with open(path, "r", errors="replace") as f:
+            text = f.read(65536)
+    except OSError:
+        return []
+    hosts = []
+    for h in URL_IN_TEXT.findall(text):
+        h = h.lower()
+        if h not in hosts:
+            hosts.append(h)
+    script_host_cache[key] = hosts[:32]
+    return script_host_cache[key]
+
+
+def host_ips(host):
+    """Forward-resolve (cached) for matching a command line to a destination."""
+    c = fwd_cache.get(host)
+    if c and time.time() - c["ts"] < 300:
+        return c["ips"]
+    if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", host) or ":" in host:
+        ips = [host]
+    else:
+        try:
+            ips = sorted({ai[4][0] for ai in socket.getaddrinfo(host, None)})
+        except (OSError, UnicodeError):
+            ips = []
+    fwd_cache[host] = {"ips": ips, "ts": time.time()}
+    return ips
+
+
+NON_NETWORK = SHELLS | {"sleep", "cat", "grep", "sed", "awk", "head", "tail", "tr", "cut", "sort",
+                        "uniq", "wc", "jq", "date", "printf", "echo", "test", "[", "true", "false",
+                        "basename", "dirname", "readlink", "mkdir", "rm", "mv", "cp", "ls", "stat",
+                        "notify-send", "hyprctl", "pgrep", "ps", "id", "env", "tee", "xargs"}
+
+
+def attribute(ev):
+    """-> (record, confidence) for a kernel connection event."""
+    ts = ev["ts"]
+    me = os.getpid()
+    with proc_lock:
+        # never blame Citadel's own helpers (pacman -Qqo, nmcli, ss, journalctl)
+        cands = [r for r in proc_seen.values()
+                 if r["start"] <= ts + 0.3 and (r["end"] is None or r["end"] >= ts - 0.6)
+                 and r.get("ppid") != me and r["pid"] != me
+                 and r["comm"] not in NON_NETWORK and os.path.basename(r["exe"]) not in NON_NETWORK]
+    # 1. the command line names a host that resolves to this destination
+    for r in sorted(cands, key=lambda r: -r["start"]):
+        for h in r["hosts"]:
+            if ev["dst"] in host_ips(h):
+                return r, "matched"
+    # 2. a running launcher script whose text names a host that resolves to
+    #    this destination (its child was too quick for the watcher to see)
+    with proc_lock:
+        scripts = [r for r in proc_seen.values() if r["scriptHosts"]
+                   and r["start"] <= ts + 0.3 and (r["end"] is None or r["end"] >= ts - 0.6)]
+    for r in sorted(scripts, key=lambda r: -r["start"]):
+        for h in r["scriptHosts"]:
+            if ev["dst"] in host_ips(h):
+                child = {"pid": 0, "exe": "", "cgroup": r["cgroup"],
+                         "origin": {"via": {"name": r["name"], "kind": "script", "id": r["args"][1] if len(r["args"]) > 1 and r["args"][1].startswith("/") else r["name"]},
+                                    "cmd": "", "chain": [r["name"]], "unit": unit_name(r["cgroup"])}}
+                return child, "matched"
+    # 3. exactly one short-lived candidate started just before the connection
+    fresh = [r for r in cands if ts - 3.0 <= r["start"] <= ts + 0.3]
+    if len(fresh) == 1:
+        return fresh[0], "likely"
+    if fresh:
+        return max(fresh, key=lambda r: r["start"]), "unclear"
+    return None, "unknown"
+
+
+def short_connections(conns, prev_keys):
+    """Kernel events whose sockets the poll never saw -> connection records."""
+    now = time.time()
+    with kev_lock:
+        ready = [e for e in kernel_events if now - e["ts"] >= 0.4]
+        kernel_events[:] = [e for e in kernel_events if now - e["ts"] < 0.4]
+    seen = {(c["lport"], c["raddr"], c["rport"]) for c in conns} | prev_keys
+    out = []
+    for ev in ready:
+        if (ev["spt"], ev["dst"], ev["dpt"]) in seen or classify(ev["dst"]) in ("loopback", "multicast"):
+            continue
+        rec, conf = attribute(ev)
+        guess = ""
+        if conf == "unclear" and rec:
+            # a timing guess is not good enough to name the app (or to base a
+            # policy on it): keep it only as a hint
+            go = (rec.get("origin") or {}).get("via") or {}
+            guess = os.path.basename(rec.get("exe", "")) + (" via " + go["name"] if go.get("name") else "")
+            rec = None
+        o = (rec or {}).get("origin") or {}
+        v = o.get("via") or {}
+        exe = (rec or {}).get("exe", "")
+        host = rdns(ev["dst"])
+        out.append({
+            "key": "short|%s|%d|%s|%d|%.3f" % (ev["proto"], ev["spt"], ev["dst"], ev["dpt"], ev["ts"]),
+            "short": True, "ts": ev["ts"], "confidence": conf,
+            "proto": ev["proto"], "state": "finished", "raddr": ev["dst"], "rport": ev["dpt"], "lport": ev["spt"],
+            "pid": (rec or {}).get("pid", 0), "exe": exe,
+            "app": os.path.basename(exe) if exe else ("short-lived process" if rec else "unknown"),
+            "cgroup": (rec or {}).get("cgroup", ""), "system": False, "scope": classify(ev["dst"]),
+            "host": host or "", "cc": country(ev["dst"]), "up": 0, "down": 0, "upRate": 0, "downRate": 0,
+            "new": True, "list": list_match(host, ev["dst"]), "guess": guess,
+            "via": v.get("name", ""), "viaId": v.get("id", ""), "viaKind": v.get("kind", ""),
+            "cmd": o.get("cmd", ""), "chain": o.get("chain", []), "unit": o.get("unit", "")})
+    return out
+
+
+EMPTY_ORIGIN = {"via": "", "viaId": "", "viaKind": "", "cmd": "", "chain": [], "unit": ""}
+
+
+def origin_fields(pid, cg):
+    o = origin(pid, cg)
+    if not o:
+        return dict(EMPTY_ORIGIN, unit=unit_name(cg))
+    v = o["via"] or {}
+    return {"via": v.get("name", ""), "viaId": v.get("id", ""), "viaKind": v.get("kind", ""),
+            "cmd": o["cmd"], "chain": o["chain"], "unit": o["unit"]}
+
 
 def app_name(exe, comm, cg):
     if exe:
@@ -783,8 +1218,11 @@ def tick(hist, prev, table_cache):
              "host": host or "", "cc": country(r["raddr"]),
              "up": r["up"], "down": r["down"], "upRate": up_rate, "downRate": down_rate,
              "new": p is None, "list": list_match(host, r["raddr"]) if not system else ""}
+        c.update(origin_fields(r["pid"], r["cgroup"]) if (r["pid"] and not system) else EMPTY_ORIGIN)
         conns.append(c)
-    nextprev = {c["key"]: {"ts": now, "up": c["up"], "down": c["down"]} for c in conns}
+    nextprev = {c["key"]: {"ts": now, "up": c["up"], "down": c["down"],
+                           "sock": (c["lport"], c["raddr"], c["rport"])} for c in conns}
+    short = short_connections(conns, {p["sock"] for p in prev.values() if "sock" in p})
 
     app_out = {}
     for exe, a in apps.items():
@@ -798,9 +1236,13 @@ def tick(hist, prev, table_cache):
     rx, tx = iface_totals()
     hist.sample(int(now), rx, tx)
     hist.update(conns, now)
+    if short:
+        hist.record_short(short)
     net = network_ids()
     emit({"type": "tick", "ts": now, "uid": MY_UID, "conns": conns, "apps": app_out,
           "totals": {"rx": rx, "tx": tx}, "network": {"names": net["names"], "ssid": net["ssid"], "source": net["source"]},
+          "short": short,
+          "kernelLog": {"running": kernel_state["running"], "error": kernel_state["error"], "seen": kernel_state["seen"]},
           "rdnsPending": len(rdns_pending)})
     return nextprev
 
@@ -828,6 +1270,8 @@ def handle(cmd, hist):
 
 
 def main():
+    threading.Thread(target=process_watcher, daemon=True).start()
+    threading.Thread(target=kernel_log_reader, daemon=True).start()
     hist = History()
     prev = {}
     geo_status()

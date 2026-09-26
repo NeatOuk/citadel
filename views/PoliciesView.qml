@@ -15,6 +15,7 @@ Column {
   property string filterProfile: "*all*"
   property string editId: ""
   property string formApp: "*"
+  property string formVia: "*"
   property string formAction: "deny"
   property string formProfile: "*"
   property string formDuration: "forever"
@@ -34,6 +35,19 @@ Column {
     })
     return out
   }
+  // launchers seen in traffic (and in existing policies) for "Started by"
+  readonly property var viaChoices: {
+    var seen = { "*": true }
+    var out = [{ value: "*", label: "However it starts" }]
+    function add(id, name, kind) {
+      if (!id || seen[id]) return
+      seen[id] = true
+      out.push({ value: id, label: (kind === "terminal" ? "in " : "via ") + (name || Model.viaLabel(id)) + (id.indexOf("/") === 0 ? "  —  " + id : "") })
+    }
+    s.conns.forEach(function(c) { if (!c.system && (formApp === "*" || c.exe === formApp)) add(c.viaId, c.via, c.viaKind) })
+    s.rules.forEach(function(r) { if (r.via && r.via !== "*") add(r.via, Model.viaLabel(r.via), "") })
+    return out
+  }
   readonly property var profileChoices: [{ value: "*", label: "All zones" }].concat(
     s.profiles.map(function(pr) { return { value: pr.name, label: pr.name + " zone" } }))
   readonly property var shownRules: s.rules.filter(function(r) {
@@ -41,16 +55,17 @@ Column {
   }).slice().sort(function(a, b) { return Model.specificity(b) - Model.specificity(a) || b.createdAt - a.createdAt })
 
   function describe(r) {
-    var who = r.app === "*" ? "Any app" : r.app.split("/").pop()
+    var who = (r.app === "*" ? "Any app" : r.app.split("/").pop())
+              + (r.via && r.via !== "*" ? " via " + Model.viaLabel(r.via) : "")
     var where = r.host === "*" ? "every host" : r.host
     return who + "  →  " + where + (r.port !== "*" ? ":" + r.port : "")
   }
   function resetForm() {
-    editId = ""; formApp = "*"; formAction = "deny"; formProfile = "*"; formDuration = "forever"
+    editId = ""; formApp = "*"; formVia = "*"; formAction = "deny"; formProfile = "*"; formDuration = "forever"
     hostField.text = ""; portField.text = ""
   }
   function edit(r) {
-    editId = r.id; formApp = r.app; formAction = r.action; formProfile = r.profile
+    editId = r.id; formApp = r.app; formVia = r.via || "*"; formAction = r.action; formProfile = r.profile
     formDuration = r.duration === "untilQuit" ? "untilQuit" : "forever"
     hostField.text = r.host === "*" ? "" : r.host
     portField.text = r.port === "*" ? "" : String(r.port)
@@ -60,7 +75,7 @@ Column {
     var port = portField.text.trim() || "*"
     if (formApp === "*" && host === "*") { message = "Choose an app, a host, or both."; return }
     if (port !== "*" && !(Number(port) >= 1 && Number(port) <= 65535)) { message = "Port must be 1–65535."; return }
-    var fields = { app: formApp, host: host, port: port, action: formAction, profile: formProfile,
+    var fields = { app: formApp, via: formApp === "*" ? "*" : formVia, host: host, port: port, action: formAction, profile: formProfile,
                    duration: formDuration,
                    pids: formDuration === "untilQuit" && s.apps[formApp] ? s.apps[formApp].pids : [] }
     if (editId) s.updateRule(editId, fields); else s.addRule(fields)
@@ -152,7 +167,16 @@ Column {
     value: root.formApp
     options: root.appChoices
     foreground: root.p.foreground
-    onChanged: function(v) { root.formApp = v }
+    onChanged: function(v) { root.formApp = v; root.formVia = "*" }
+  }
+  Dropdown {
+    width: parent.width
+    visible: root.formApp !== "*" && root.viaChoices.length > 1
+    label: "Started by"
+    value: root.formVia
+    options: root.viaChoices
+    foreground: root.p.foreground
+    onChanged: function(v) { root.formVia = v }
   }
   RowLayout {
     width: parent.width
