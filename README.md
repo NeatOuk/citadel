@@ -152,8 +152,21 @@ neat.citadel/
 ~/.local/share/citadel/          state.json, history.db, feeds, GeoIP, enforce spec
 ```
 
-Run the logic tests with `node tests/model.test.js`. Country data is from
-[DB-IP Lite](https://db-ip.com) (CC BY 4.0).
+Run the logic tests with `node tests/model.test.js`.
+
+## Third-party data
+
+Citadel bundles no third-party data. It downloads these only when you ask:
+
+| Data | Publisher | When |
+|---|---|---|
+| Country database | [DB-IP Lite](https://db-ip.com), CC BY 4.0 | Settings → Download |
+| FireHOL Level 1 | [FireHOL](https://iplists.firehol.org/) | when you enable the feed |
+| Spamhaus DROP | [Spamhaus](https://www.spamhaus.org/blocklists/do-not-route-or-peer/) | when you enable the feed |
+| StevenBlack hosts | [StevenBlack/hosts](https://github.com/StevenBlack/hosts) | when you enable the feed |
+| HaGeZi Light | [hagezi/dns-blocklists](https://github.com/hagezi/dns-blocklists) | when you enable the feed |
+
+Each feed is published under its own license and terms of use; check them before relying on a feed.
 
 ## License
 
