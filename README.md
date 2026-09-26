@@ -40,6 +40,16 @@ omarchy plugin add https://github.com/NeatOuk/citadel.git --enable
 
 Then open Citadel from the tower icon in the bar. Go to **Settings → Enforcement** and turn it on.
 
+### Remove
+
+```bash
+omarchy plugin remove neat.citadel     # disables it (off the bar) and deletes the folder
+sudo pacman -R citadel-helper          # if installed; switches enforcement off first
+rm -rf ~/.local/share/citadel          # optional: your policies, history, feeds and GeoIP data
+```
+
+Citadel never edits your own configuration files. It only writes to `~/.local/share/citadel/`.
+
 ### Requirements
 
 | Need | Package | Notes |
