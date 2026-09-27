@@ -91,8 +91,8 @@ Column {
     wrapMode: Text.WordWrap
     maximumLineCount: 5
     font.pixelSize: Style.font.caption
-    text: "Security update: citadel-helper " + root.s.helperVersion + " is older than " + root.s.minHelper
-          + ", which fixes a way for other programs to close other users' connections. Update it:\n"
+    text: "Security update: citadel-helper " + root.s.helperVersion + " " + root.s.helperProblem
+          + " (other programs could use it to close other users' connections). Update it:\n"
           + "cd citadel-helper && git pull && makepkg -si"
   }
   Lbl {

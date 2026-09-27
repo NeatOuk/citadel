@@ -109,6 +109,15 @@ eq("via rule survives after curl exits", (firstCg(vs2.spec) || {}).cgroup, CGT)
 eq("grouping splits launchers", M.groupByApp([CURLC(), CURLC({ viaId: "/x/y", via: "y" })], {}).length, 2)
 eq("origin label", M.originLabel(CURLC()), "via omarchy-network-speedtest")
 eq("terminal label", M.originLabel(CURLC({ via: "ghostty", viaKind: "terminal" })), "started in ghostty")
+// helper gate: no privileged requests to helpers older than 1.1.1
+eq("gate: missing", M.helperGate(false, "", "1.1.1"), { usable: false, reason: "missing" })
+eq("gate: version unknown yet", M.helperGate(true, "", "1.1.1"), { usable: false, reason: "checking" })
+eq("gate: pre-1.1.1 (no version = 1.1.0)", M.helperGate(true, "1.1.0", "1.1.1").usable, false)
+eq("gate: outdated reason", M.helperGate(true, "1.0.9", "1.1.1").reason, "outdated")
+eq("gate: 1.1.1 ok", M.helperGate(true, "1.1.1", "1.1.1").usable, true)
+eq("gate: 1.2.1 ok", M.helperGate(true, "1.2.1", "1.1.1").usable, true)
+eq("gate: unreleased 1.2.0 refused", M.helperGate(true, "1.2.0", "1.1.1").usable, false)
+eq("gate: 1.10.0 ok", M.helperGate(true, "1.10.0", "1.1.1").usable, true)
 
 // profiles
 const profiles = [{ name: "Home", networks: ["US"] }, { name: "Public", networks: ["Cafe WiFi"] }]
