@@ -14,7 +14,10 @@ Everything you decide becomes a **policy** that Citadel enforces with nftables.
 
 Citadel watches and asks without any extra software. To actually **block**
 traffic it needs **[citadel-helper](https://github.com/NeatOuk/citadel-helper)**,
-a small root helper that turns your policies into nftables rules. Build and install it once:
+a small root helper that turns your policies into nftables rules. **Citadel needs
+citadel-helper 1.1.1 or newer** ([tag `v1.1.1`](https://github.com/NeatOuk/citadel-helper/releases/tag/v1.1.1)),
+which only ever closes your own connections. Settings warns if an older helper
+is installed. Build and install it once:
 
 ```bash
 git clone https://github.com/NeatOuk/citadel-helper.git

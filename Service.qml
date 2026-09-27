@@ -94,6 +94,18 @@ Item {
   property string enforceError: ""
   property real enforceAppliedAt: 0
   property int enforceDrops: 0
+  // citadel-helper 1.1.1 fixed kill requests that could close other users'
+  // sockets; older helpers report no version at all
+  readonly property string minHelper: "1.1.1"
+  readonly property bool helperOutdated: helperVersion !== "" && _versionLess(helperVersion, minHelper)
+  function _versionLess(a, b) {
+    var x = String(a).split("."), y = String(b).split(".")
+    for (var i = 0; i < 3; i++) {
+      var d = (Number(x[i]) || 0) - (Number(y[i]) || 0)
+      if (d !== 0) return d < 0
+    }
+    return false
+  }
   property string _lastSpec: ""
 
   // ------------------------------------------------- persistence
@@ -679,7 +691,7 @@ Item {
         var s = JSON.parse(out)
         root.enforceActive = !!s.active
         root.enforceDrops = Number(s.drops) || 0
-        root.helperVersion = s.version || "1.1"
+        root.helperVersion = s.version || "1.1.0"
         root.helperLogging = !!s.logging
       } catch (e) {}
     })

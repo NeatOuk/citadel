@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "neat.citadel",
   "name": "Citadel",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "author": "Neat Ouk",
   "license": "MIT",
   "description": "Citadel: an outbound firewall for Omarchy. See what leaves your machine, decide at the gate, enforce per-app policies with nftables.",
@@ -34,7 +34,7 @@
     "optional": {
       "networkmanager": "zone switching by connection name (iwd and wired interfaces also work)",
       "python-maxminddb": "countries",
-      "citadel-helper": "enforcement: https://github.com/NeatOuk/citadel-helper (build with makepkg -si)"
+      "citadel-helper": ">= 1.1.1 (tag v1.1.1) for enforcement: https://github.com/NeatOuk/citadel-helper (build with makepkg -si)"
     },
     "groups": {
       "wheel": "run the helper without a password prompt"
