@@ -45,15 +45,24 @@ Column {
     var where = r.host === "*" ? "every host" : r.host
     return who + "  →  " + where + (r.port !== "*" ? ":" + r.port : "")
   }
+  // Dropdowns overwrite their own `value` when used, which breaks a binding,
+  // so the form pushes values into them explicitly.
+  function _syncForm() {
+    appDrop.value = formApp; zoneDrop.value = formProfile
+  }
   function resetForm() {
     editId = ""; formApp = "*"; formAction = "deny"; formProfile = "*"; formDuration = "forever"
     hostField.text = ""; portField.text = ""
+    _syncForm()
   }
   function edit(r) {
     editId = r.id; formApp = r.app; formAction = r.action; formProfile = r.profile
     formDuration = r.duration === "untilQuit" ? "untilQuit" : "forever"
     hostField.text = r.host === "*" ? "" : r.host
     portField.text = r.port === "*" ? "" : String(r.port)
+    _syncForm()
+    message = "Editing: " + describe(r)
+    if (p && p.scrollToTop) p.scrollToTop()        // the form sits above the list
   }
   function submit() {
     var host = hostField.text.trim() || "*"
@@ -64,8 +73,9 @@ Column {
                    duration: formDuration,
                    pids: formDuration === "untilQuit" && s.apps[formApp] ? s.apps[formApp].pids : [] }
     if (editId) s.updateRule(editId, fields); else s.addRule(fields)
-    message = editId ? "Policy updated." : "Policy added."
+    var done = editId ? "Policy updated." : "Policy added."
     resetForm()
+    message = done
   }
 
   // ---------------------------------------------------------------- clipboard
@@ -94,59 +104,10 @@ Column {
     LinkButton { p: root.p; text: "Export"; onClicked: { copyProc.payload = root.s.exportRules(); copyProc.running = true } }
     LinkButton { p: root.p; text: "Import"; onClicked: pasteProc.running = true }
   }
-  ButtonGroup {
-    options: [{ value: "*all*", label: "All zones" }].concat(root.s.profiles.map(function(pr) { return { value: pr.name, label: pr.name } }))
-    value: root.filterProfile
-    foreground: root.p.foreground
-    fontFamily: root.p.fontFamily
-    fontSize: Style.font.caption
-    onChanged: function(v) { root.filterProfile = v }
-  }
-  Lbl {
-    p: root.p
-    visible: root.shownRules.length === 0
-    dim: true
-    width: parent.width
-    wrapMode: Text.WordWrap
-    maximumLineCount: 3
-    text: "No policies yet. Choose “Always allow” or “Block” at the gate, use Allow / Block in Traffic, or add one below."
-  }
-  Repeater {
-    model: root.shownRules
-    delegate: RowLayout {
-      required property var modelData
-      width: root.width
-      spacing: Style.space(8)
-      Lbl {
-        p: root.p
-        text: modelData.action === "deny" ? "✕" : "✓"
-        color: modelData.action === "deny" ? root.p.urgent : root.p.foreground
-        strong: true
-        font.pixelSize: Style.font.body
-      }
-      Column {
-        Layout.fillWidth: true
-        Lbl { p: root.p; width: parent.width; text: root.describe(modelData); elide: Text.ElideMiddle }
-        Lbl {
-          p: root.p
-          width: parent.width
-          dim: true
-          font.pixelSize: Style.font.caption
-          text: (modelData.profile === "*" ? "all zones" : modelData.profile + " zone")
-                + (modelData.duration === "untilQuit" ? " · until the app quits" : "")
-                + (root.s.approx[modelData.id] ? " · per destination (app shares its group)" : "")
-                + (modelData.note ? " · " + modelData.note : "")
-        }
-      }
-      LinkButton { p: root.p; text: "Edit"; onClicked: root.edit(modelData) }
-      LinkButton { p: root.p; danger: true; text: "Remove"; onClicked: root.s.removeRule(modelData.id) }
-    }
-  }
-
   // ---------------------------------------------------------------- form
-  PanelSeparator { foreground: root.p.foreground }
   PanelSectionHeader { text: root.editId ? "EDIT POLICY" : "NEW POLICY"; foreground: root.p.foreground; fontFamily: root.p.fontFamily }
   Dropdown {
+    id: appDrop
     width: parent.width
     label: "App"
     value: root.formApp
@@ -193,6 +154,7 @@ Column {
     }
   }
   Dropdown {
+    id: zoneDrop
     width: parent.width
     label: "Zone"
     value: root.formProfile
@@ -216,6 +178,61 @@ Column {
       fontSize: Style.font.bodySmall
       bordered: true
       onClicked: root.submit()
+    }
+  }
+
+  PanelSeparator { foreground: root.p.foreground }
+  ButtonGroup {
+    options: [{ value: "*all*", label: "All zones" }].concat(root.s.profiles.map(function(pr) { return { value: pr.name, label: pr.name } }))
+    value: root.filterProfile
+    foreground: root.p.foreground
+    fontFamily: root.p.fontFamily
+    fontSize: Style.font.caption
+    onChanged: function(v) { root.filterProfile = v }
+  }
+  Lbl {
+    p: root.p
+    visible: root.shownRules.length === 0
+    dim: true
+    width: parent.width
+    wrapMode: Text.WordWrap
+    maximumLineCount: 3
+    text: "No policies yet. Choose “Always allow” or “Block” at the gate, use Allow / Block in Traffic, or add one below."
+  }
+  Repeater {
+    model: root.shownRules
+    delegate: RowLayout {
+      required property var modelData
+      width: root.width
+      spacing: Style.space(8)
+      Lbl {
+        p: root.p
+        text: modelData.action === "deny" ? "✕" : "✓"
+        color: modelData.action === "deny" ? root.p.urgent : root.p.foreground
+        strong: true
+        font.pixelSize: Style.font.body
+      }
+      Column {
+        Layout.fillWidth: true
+        Lbl { p: root.p; width: parent.width; text: root.describe(modelData); elide: Text.ElideMiddle }
+        Lbl {
+          p: root.p
+          width: parent.width
+          dim: true
+          font.pixelSize: Style.font.caption
+          text: (modelData.profile === "*" ? "all zones" : modelData.profile + " zone")
+                + (modelData.duration === "untilQuit" ? " · until the app quits" : "")
+                + (root.s.approx[modelData.id] ? " · per destination (app shares its group)" : "")
+                + (modelData.note ? " · " + modelData.note : "")
+        }
+      }
+      LinkButton {
+        p: root.p
+        text: root.editId === modelData.id ? "Editing" : "Edit"
+        font.underline: root.editId === modelData.id
+        onClicked: root.editId === modelData.id ? root.resetForm() : root.edit(modelData)
+      }
+      LinkButton { p: root.p; danger: true; text: "Remove"; onClicked: root.s.removeRule(modelData.id) }
     }
   }
 

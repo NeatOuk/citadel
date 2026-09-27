@@ -46,6 +46,8 @@ Panel {
     return m
   }
 
+  function scrollToTop() { panelFlick.contentY = 0 }
+
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
@@ -80,6 +82,14 @@ Panel {
       try { return citadel.addRule(JSON.parse(json)).id } catch (e) { return "error: " + e }
     }
     function removeRule(id: string): void { citadel.removeRule(id) }
+    // open Policies with the form filled for one policy (same path as its Edit button)
+    function editPolicy(id: string): bool {
+      var r = citadel.rules.filter(function(x) { return x.id === id })[0]
+      if (!r) return false
+      root.view = "policies"; root.open()
+      Qt.callLater(function() { policiesView.edit(r) })
+      return true
+    }
     function rules(): string { return JSON.stringify(citadel.rules) }
     function setList(id: string, on: bool): void { citadel.setListEnabled(id, on) }
     function lists(): string { return JSON.stringify({ lists: citadel.lists, status: citadel.listStatus, ipCidrs: citadel.ipCidrs.length }) }
@@ -91,6 +101,7 @@ Panel {
                               connections: citadel.totals.connections, policies: citadel.rules.length,
                               monitorUp: citadel.monitorUp, helperInstalled: citadel.helperInstalled,
                               enforceError: citadel.enforceError, drops: citadel.enforceDrops,
+                              helperVersion: citadel.helperVersion, helperOutdated: citadel.helperOutdated,
                               omarchy: citadel.omarchyVersion, omarchySupported: citadel.omarchySupported,
                               inWheel: citadel.inWheel, networkSource: citadel.network.source || "" })
     }
@@ -294,7 +305,7 @@ Panel {
             }
           }
           TrafficView { visible: root.view === "traffic"; width: parent.width; p: root; s: citadel }
-          PoliciesView { visible: root.view === "policies"; width: parent.width; p: root; s: citadel }
+          PoliciesView { id: policiesView; visible: root.view === "policies"; width: parent.width; p: root; s: citadel }
           HistoryView { visible: root.view === "history"; width: parent.width; p: root; s: citadel }
           SettingsView { visible: root.view === "settings"; width: parent.width; p: root; s: citadel }
         }
