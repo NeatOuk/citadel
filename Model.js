@@ -388,6 +388,27 @@ function activeProfile(profiles, override, networkNames) {
   return profiles.length ? profiles[0].name : "Default"
 }
 
+// ------------------------------------------------------------------ helper gate
+
+function versionLess(a, b) {
+  var x = String(a).split("."), y = String(b).split(".")
+  for (var i = 0; i < 3; i++) {
+    var d = (Number(x[i]) || 0) - (Number(y[i]) || 0)
+    if (d !== 0) return d < 0
+  }
+  return false
+}
+
+// May the plugin send privileged requests (apply / kill) to the helper?
+// Only once its version is known and at least `min`: older helpers have a
+// kill path that can close other users' sockets. ("off" is always allowed.)
+function helperGate(installed, version, min) {
+  if (!installed) return { usable: false, reason: "missing" }
+  if (!version) return { usable: false, reason: "checking" }
+  if (versionLess(version, min)) return { usable: false, reason: "outdated" }
+  return { usable: true, reason: "" }
+}
+
 // ------------------------------------------------------------------ grouping
 
 // conns -> [{app, exe, conns, up, down, upRate, downRate, verdicts}], busiest first

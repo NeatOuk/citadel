@@ -91,16 +91,11 @@ Item {
   // citadel-helper 1.1.1 fixed kill requests that could close other users'
   // sockets; older helpers report no version at all
   readonly property string minHelper: "1.1.1"
-  property string helperVersion: ""
-  readonly property bool helperOutdated: helperVersion !== "" && _versionLess(helperVersion, minHelper)
-  function _versionLess(a, b) {
-    var x = String(a).split("."), y = String(b).split(".")
-    for (var i = 0; i < 3; i++) {
-      var d = (Number(x[i]) || 0) - (Number(y[i]) || 0)
-      if (d !== 0) return d < 0
-    }
-    return false
-  }
+  property string helperVersion: ""          // "" until `status` answered
+  readonly property var helperGate: Model.helperGate(helperInstalled, helperVersion, minHelper)
+  // the only condition under which apply / kill may be sent to the helper
+  readonly property bool helperUsable: helperGate.usable
+  readonly property bool helperOutdated: helperGate.reason === "outdated"
   property string _lastSpec: ""
 
   // ------------------------------------------------- persistence
@@ -476,14 +471,37 @@ Item {
     onExited: function(code) {
       var was = root.helperInstalled
       root.helperInstalled = code === 0
-      if (!was && root.helperInstalled) {
-        if (root.enforceError.indexOf("helper") !== -1) root.enforceError = ""
-        if (root.enforce) root._syncEnforcement(true)
-      }
+      if (!root.helperInstalled) root.helperVersion = ""
+      if (!was && root.helperInstalled) root.verifyHelper()
     }
   }
   // pick the helper up as soon as the package is installed
   Timer { interval: 10000; repeat: true; running: !root.helperInstalled; onTriggered: helperCheck.running = true }
+  // an outdated helper may be upgraded at any time: re-check its version
+  Timer { interval: 60000; repeat: true; running: root.helperInstalled && root.helperOutdated; onTriggered: root.verifyHelper() }
+
+  // Ask the helper for its version (read-only `status`) before anything else.
+  // Helpers before 1.1.1 report no version; they are treated as 1.1.0.
+  function verifyHelper() {
+    if (!helperInstalled) return
+    _run(["status"], function(code, out) {
+      var s = {}
+      try { s = JSON.parse(out) } catch (e) {}
+      root.helperVersion = code === 0 ? (s.version || "1.1.0") : ""
+      if (code === 0) {
+        root.enforceActive = !!s.active
+        root.enforceDrops = Number(s.drops) || 0
+      }
+      if (root.helperOutdated) {
+        root.enforceError = root.enforce
+          ? "Enforcement paused: citadel-helper " + root.helperVersion + " is older than " + root.minHelper + " and has a security bug. Update it (see below)."
+          : ""
+      } else if (root.helperUsable) {
+        if (root.enforceError.indexOf("citadel-helper") !== -1) root.enforceError = ""
+        if (root.enforce) { root._lastSpec = ""; root._syncEnforcement(true) }
+      }
+    })
+  }
 
   property var _jobs: []
   Process {
@@ -500,6 +518,13 @@ Item {
     }
   }
   function _run(args, done) {
+    // Single choke point for privileged calls: "apply" and "kill" are only
+    // ever sent to a helper whose verified version is >= minHelper.
+    // ("status" and "off" are safe with any helper.)
+    if ((args[0] === "apply" || args[0] === "kill") && !helperUsable) {
+      if (done) done(1, "", "refused: citadel-helper " + (helperVersion || "version unknown") + " is not >= " + minHelper)
+      return
+    }
     _jobs = _jobs.concat([{ args: args, done: done }])
     _pump()
   }
@@ -524,7 +549,7 @@ Item {
         root.enforceActive = true
         root.enforceError = ""
         root.enforceAppliedAt = Date.now() / 1000
-        if (root.helperVersion === "") root.refreshEnforceStatus()
+        // (apply only runs once the helper version was verified)
       } else {
         root.enforceActive = false
         root._lastSpec = ""
@@ -556,7 +581,7 @@ Item {
     if (!syncTimer.running || force) syncTimer.restart()
   }
   function _doSync() {
-    if (!enforce || !helperInstalled || uid < 0) return
+    if (!enforce || !helperUsable || uid < 0) return
     var res = Model.buildSpec(rules, _ctx(), conns, apps, ipCidrs, uid)
     approx = res.approx
     var text = JSON.stringify(res.spec)
@@ -568,7 +593,7 @@ Item {
     specFile.setText(text + "\n")
   }
   function _kill(targets) {
-    if (!enforce || !helperInstalled || !targets || !targets.length) return
+    if (!enforce || !helperUsable || !targets || !targets.length) return
     killFile.setText(JSON.stringify(targets) + "\n")
   }
 
@@ -581,9 +606,17 @@ Item {
 
   function setEnforce(on) {
     if (on && !helperInstalled) { enforceError = "Install citadel-helper first: github.com/NeatOuk/citadel-helper"; return }
+    if (on && helperOutdated) {
+      enforceError = "citadel-helper " + helperVersion + " is older than " + minHelper + " and has a security bug. Update it before turning enforcement on."
+      return
+    }
     enforce = !!on
     save()
-    if (enforce) { _lastSpec = ""; _syncEnforcement(true) }
+    if (enforce) {
+      _lastSpec = ""
+      if (helperUsable) _syncEnforcement(true)
+      else verifyHelper()                        // version not known yet: check first
+    }
     else {
       enforceBusy = true
       _run(["off"], function(code, out, err) {
@@ -601,6 +634,7 @@ Item {
         root.enforceActive = !!s.active
         root.enforceDrops = Number(s.drops) || 0
         root.helperVersion = s.version || "1.1.0"
+        if (root.helperOutdated && root.enforce) root.enforceActive = false
       } catch (e) {}
     })
   }

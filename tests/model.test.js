@@ -85,6 +85,15 @@ eq("learned kept", M.learnedIps(L), { h1: ["1.2.3.4"] })
 eq("learned in spec", M.buildSpec([hr], ctx({ learned: M.learnedIps(L) }), [], {}, [], 1000).spec.rules[0].targets, [{ ip: "1.2.3.4", port: null }])
 eq("learned expires", M.learnedIps(M.learnTargets(L, [hr], [], 5000, 3600)), {})
 
+// helper gate: no privileged requests to helpers older than 1.1.1
+eq("gate: missing", M.helperGate(false, "", "1.1.1"), { usable: false, reason: "missing" })
+eq("gate: version unknown yet", M.helperGate(true, "", "1.1.1"), { usable: false, reason: "checking" })
+eq("gate: pre-1.1.1 (no version = 1.1.0)", M.helperGate(true, "1.1.0", "1.1.1").usable, false)
+eq("gate: outdated reason", M.helperGate(true, "1.0.9", "1.1.1").reason, "outdated")
+eq("gate: 1.1.1 ok", M.helperGate(true, "1.1.1", "1.1.1").usable, true)
+eq("gate: 1.2.1 ok", M.helperGate(true, "1.2.1", "1.1.1").usable, true)
+eq("gate: 1.10.0 ok", M.helperGate(true, "1.10.0", "1.1.1").usable, true)
+
 // profiles
 const profiles = [{ name: "Home", networks: ["US"] }, { name: "Public", networks: ["Cafe WiFi"] }]
 eq("profile by ssid", M.activeProfile(profiles, "", ["Cafe WiFi"]), "Public")
