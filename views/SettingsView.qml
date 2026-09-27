@@ -86,6 +86,18 @@ Column {
   Lbl {
     p: root.p
     width: parent.width
+    visible: root.s.helperInstalled && root.s.helperOutdated
+    color: root.p.urgent
+    wrapMode: Text.WordWrap
+    maximumLineCount: 5
+    font.pixelSize: Style.font.caption
+    text: "Security update: citadel-helper " + root.s.helperVersion + " is older than " + root.s.minHelper
+          + ", which fixes a way for other programs to close other users' connections. Update it:\n"
+          + "cd citadel-helper && git pull && makepkg -si"
+  }
+  Lbl {
+    p: root.p
+    width: parent.width
     visible: !root.s.helperInstalled
     color: root.p.urgent
     wrapMode: Text.WordWrap
