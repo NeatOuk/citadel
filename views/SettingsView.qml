@@ -132,7 +132,7 @@ Column {
     wrapMode: Text.WordWrap
     maximumLineCount: 4
     font.pixelSize: Style.font.caption
-    text: "Allow policies can send an app through a proxy (Policies → Route). If a proxy is down, those connections are blocked, never sent direct."
+    text: "In Policies, "Allow via proxy" sends an app through one of these. If a proxy is down, those connections are blocked, never sent direct."
           + (!root.s.enforce ? " Routing needs enforcement on." : "")
   }
   Lbl {
