@@ -6,6 +6,7 @@ import Quickshell.Io
 import qs.Commons
 import qs.Ui
 import "Model.js" as Model
+import "Registry.js" as Registry
 import "views"
 
 // Citadel: outbound firewall for the Omarchy bar. Bar tower icon, the
@@ -59,11 +60,23 @@ Panel {
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
-  Service {
-    id: citadel
-    settings: root.settings
-    pluginDir: root.pluginDir
-    onOpenRequested: function(v) { root.view = v; root.open() }
+  // One Service per shell, shared by the widget on every screen (Registry.js).
+  Component { id: serviceComp; Service { objectName: "citadel-service" } }
+  property var _own: null                       // the Service this widget runs, if any
+  readonly property bool hostsService: !!_own && _own === citadel
+  property var citadel: _acquire()
+  function _acquire() {
+    if (Registry.alive(Registry.service)) return Registry.service
+    _own = serviceComp.createObject(root, { settings: Qt.binding(function() { return root.settings }),
+                                            pluginDir: root.pluginDir })
+    Registry.service = _own
+    return _own
+  }
+  // the widget that ran it went away (screen unplugged, bar reload): take over
+  Timer { interval: 2000; repeat: true; running: true; onTriggered: if (!Registry.alive(root.citadel)) root.citadel = root._acquire() }
+  Connections {
+    target: root.citadel
+    function onOpenRequested(v) { if (root.hostsService) { root.view = v; root.open() } }
   }
 
   IpcHandler {
