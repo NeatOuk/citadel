@@ -133,10 +133,7 @@ Column {
     id: pasteProc
     command: ["wl-paste", "--no-newline"]
     stdout: StdioCollector { id: pasteOut; waitForEnd: true }
-    onExited: {
-      var err = root.s.importRules(String(pasteOut.text || ""))
-      root.message = err ? "Import failed: " + err : "Policies imported from the clipboard."
-    }
+    onExited: importPanel.importPasted(String(pasteOut.text || ""))
   }
 
   // ---------------------------------------------------------------- list
@@ -144,7 +141,15 @@ Column {
     width: parent.width
     PanelSectionHeader { text: "POLICIES"; foreground: root.p.foreground; fontFamily: root.p.fontFamily; Layout.fillWidth: true }
     LinkButton { p: root.p; text: "Export"; onClicked: { copyProc.payload = root.s.exportRules(); copyProc.running = true } }
-    LinkButton { p: root.p; text: "Import"; onClicked: pasteProc.running = true }
+    LinkButton { p: root.p; text: importPanel.visible ? "Import ▾" : "Import ▸"; onClicked: importPanel.visible = !importPanel.visible }
+  }
+  ImportPanel {
+    id: importPanel
+    visible: false
+    width: parent.width
+    p: root.p
+    s: root.s
+    onPasteRequested: pasteProc.running = true
   }
   // ---------------------------------------------------------------- form
   PanelSectionHeader { text: root.editId ? "EDIT POLICY" : "NEW POLICY"; foreground: root.p.foreground; fontFamily: root.p.fontFamily }

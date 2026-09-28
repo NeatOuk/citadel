@@ -489,6 +489,59 @@ Item {
   }
 
   function exportRules() { return JSON.stringify({ version: 2, rules: rules }, null, 2) }
+  // Several policies at once: one save, one config, one firewall update.
+  function addRules(list) {
+    var added = list.map(function(f) { return Model.makeRule(f) })
+    var key = function(r) { return [r.profile, r.app, r.via || "*", r.host, r.port].join("|") }
+    var fresh = {}
+    added.forEach(function(r) { fresh[key(r)] = true })
+    rules = rules.filter(function(x) { return !fresh[key(x)] }).concat(added)
+    save(); _sendConfig(); _reevaluate()
+    if (enforce) _syncEnforcement(true)
+    return added.length
+  }
+
+  // A big domain list becomes a feed: a subscription when it came from a URL
+  // (kept up to date like the built-in feeds), else a local list file.
+  readonly property int importFeedThreshold: 200
+  FileView { id: importFile; atomicWrites: true; printErrors: false; watchChanges: false
+    property var entry: null
+    onSaved: { root.lists = root.lists.concat([entry]); entry = null; root.save(); root._sendConfig() }
+    onSaveFailed: entry = null }
+  function importFeed(name, domains, url) {
+    if (url) { addList(name, url, "domain"); return }
+    var id = "import-" + Date.now().toString(36)
+    importFile.entry = { id: id, name: name, url: "", local: true, kind: "domain", enabled: true }
+    importFile.path = stateDir + "/lists/" + id + ".txt"
+    importFile.setText(domains.join("\n") + "\n")
+  }
+
+  // Import from pasted text or a fetched file. opts: {plainAs: "deny"|"allow", url, name}
+  // Returns a one-line summary for the Policies view.
+  function importText(text, opts) {
+    var o = opts || {}
+    var p = Model.parseImport(text, o.plainAs)
+    if (p.format === "citadel") {
+      var err = importRules(JSON.stringify(p.rules))
+      return err ? "Import failed: " + err : "Imported " + p.rules.length + " Citadel policies."
+    }
+    if (!p.allow.length && !p.block.length) return "Nothing to import: no domains found."
+    var note = "imported" + (o.name ? " from " + o.name : "")
+    var list = p.allow.map(function(d) { return { host: d, action: "allow", note: note } })
+    var asFeed = p.block.length > importFeedThreshold
+    if (!asFeed) list = list.concat(p.block.map(function(d) { return { host: d, action: "deny", note: note } }))
+    if (list.length) addRules(list)
+    if (asFeed) importFeed((o.name || "Imported list") + " (" + p.block.length + ")", p.block, o.url || "")
+    var parts = []
+    if (p.block.length) parts.push(asFeed ? p.block.length + " blocked domains as a feed" : p.block.length + " block policies")
+    if (p.allow.length) parts.push(p.allow.length + " allow policies")
+    var sk = []
+    if (p.skipped.regex) sk.push(p.skipped.regex + " regex")
+    if (p.skipped.options) sk.push(p.skipped.options + " with options Citadel can't apply")
+    if (p.skipped.other) sk.push(p.skipped.other + " other")
+    return "Imported " + parts.join(" and ") + " (" + p.format + ")." + (sk.length ? " Skipped " + sk.join(", ") + "." : "")
+  }
+
   function importRules(text) {
     var p
     try { p = JSON.parse(text) } catch (e) { return "not valid JSON" }

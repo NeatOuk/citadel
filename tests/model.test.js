@@ -203,5 +203,26 @@ eq("origin: kept when given", M.makeRule({ app: CH, origin: "gate" }).origin, "g
   eq("sort: precedence puts app+host policies first", ids({ sort: "precedence" }).slice(0, 2).sort(), ["g1", "y1"])
 }
 
+// importing AdGuard / Pi-hole / hosts / plain lists
+{
+  const ag = M.parseImport([
+    "! AdGuard rules", "[Adblock Plus 2.0]",
+    "||ads.example.com^", "||track.example.net^$important", "@@||good.example.com^",
+    "||good.example.com^", "||x.example.org^$client=172.16.1.5", "/ads[0-9]+\\.example/",
+    "example.com##.banner", "||1.2.3.4^"].join("\n"))
+  eq("adguard: format", ag.format, "adguard")
+  eq("adguard: blocks (important ok, IP ok)", ag.block, ["1.2.3.4", "ads.example.com", "track.example.net"])
+  eq("adguard: @@ allow wins over a block", ag.allow, ["good.example.com"])
+  eq("adguard: skipped", ag.skipped, { regex: 1, options: 1, other: 1 })
+  const hosts = M.parseImport("# hosts\n0.0.0.0 a.example.com b.example.com\n127.0.0.1 localhost\n::1 c.example.com")
+  eq("hosts: format + domains", [hosts.format, hosts.block], ["hosts", ["a.example.com", "b.example.com", "c.example.com"]])
+  const pi = M.parseImport("doubleclick.net\n*.tracker.io\n(\\.|^)ads\\.example\\.com$\n", "allow")
+  eq("pi-hole plain list as allow", [pi.format, pi.allow, pi.block], ["domains", ["doubleclick.net", "tracker.io"], []])
+  eq("pi-hole regex line skipped", pi.skipped.regex, 1)
+  eq("plain list defaults to block", M.parseImport("doubleclick.net").block, ["doubleclick.net"])
+  const cj = M.parseImport(JSON.stringify({ version: 2, rules: [{ app: "/usr/bin/curl", action: "deny" }] }))
+  eq("citadel json passes through", [cj.format, cj.rules.length], ["citadel", 1])
+}
+
 console.log(`${n - fails}/${n} passed`)
 process.exit(fails ? 1 : 0)

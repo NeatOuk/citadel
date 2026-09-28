@@ -500,9 +500,15 @@ def parse_list(kind, text):
         line = line.split("#", 1)[0].strip().lower()
         if not line:
             continue
+        if line.startswith(("!", "@@", "[")):
+            continue                     # AdGuard comments, allow rules, headers
         parts = line.split()
-        # hosts format "0.0.0.0 domain", adblock "||domain^", or bare domain
+        # hosts format "0.0.0.0 domain", adblock "||domain^$important", or bare domain
         tok = parts[1] if len(parts) >= 2 and parts[0] in ("0.0.0.0", "127.0.0.1", "::", "::1") else parts[0]
+        if "$" in tok:
+            tok, _, opts = tok.partition("$")
+            if any(o.strip().lstrip("~") not in ("important", "all") for o in opts.split(",")):
+                continue                 # $client=, $dnsrewrite=… change what the rule means
         tok = tok.strip("|^").lstrip("*.")
         if DOMAIN_RE.match(tok) and tok not in ("localhost", "localhost.localdomain"):
             doms.add(tok)

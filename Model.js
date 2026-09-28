@@ -196,6 +196,76 @@ function filterRules(rules, opts, proxyName) {
     : function(a, b) { return b.createdAt - a.createdAt })
 }
 
+// ------------------------------------------------------------------ import
+// Policies from other tools: AdGuard / AdGuard Home rules, Pi-hole lists,
+// hosts files, plain domain lists, and Citadel's own JSON export.
+//   -> {format, rules (Citadel JSON only), allow: [domain], block: [domain],
+//       skipped: {regex, options, other}}
+// plainAs: what a bare "example.com" line means ("deny" or "allow"); AdGuard
+// and hosts lines say it themselves. As in AdGuard, an allow for a domain
+// wins over a block of the same domain.
+var IMPORT_OPTIONS_OK = { important: true, all: true }
+function importDomain(s) {
+  var d = String(s || "").trim().toLowerCase().replace(/\.$/, "").replace(/^\*\./, "")
+  if (isAddressLike(d)) return d
+  return /^[a-z0-9_-]+(\.[a-z0-9_-]+)+$/.test(d) && d !== "localhost.localdomain" ? d : ""
+}
+function parseImport(text, plainAs) {
+  var t = String(text || "").replace(/^\uFEFF/, "").trim()
+  var out = { format: "", rules: null, allow: [], block: [], skipped: { regex: 0, options: 0, other: 0 } }
+  if (t.charAt(0) === "{" || t.charAt(0) === "[") {
+    try {
+      var p = JSON.parse(t)
+      var list = Array.isArray(p) ? p : (p && p.rules)
+      if (Array.isArray(list)) { out.format = "citadel"; out.rules = list; return out }
+    } catch (e) {}
+  }
+  var allow = {}, block = {}
+  var seen = { adguard: 0, hosts: 0, plain: 0 }
+  var lines = t.split(/\r?\n/)
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i].trim()
+    if (!line || line.charAt(0) === "!" || line.charAt(0) === "#" || /^\[.*\]$/.test(line)) continue
+    if (/##|#@#|#\$#|#\?#/.test(line)) { out.skipped.other++; continue }          // cosmetic filters
+    line = line.replace(/\s+#.*$/, "")
+    var isAllow = line.indexOf("@@") === 0
+    if (isAllow) line = line.slice(2)
+    if (line.charAt(0) === "/" && line.length > 2) { out.skipped.regex++; continue }
+    var m = /^(0\.0\.0\.0|127\.0\.0\.1|::1?|::)\s+(.+)$/.exec(line)
+    if (m) {                                                                     // hosts file
+      seen.hosts++
+      m[2].split(/\s+/).forEach(function(h) {
+        var d = importDomain(h)
+        if (d && d !== "localhost") block[d] = true
+      })
+      continue
+    }
+    m = /^\|\|([^\^\/$|]+)\^?\|?(?:\$(.*))?$/.exec(line)
+    if (m) {                                                                     // AdGuard ||domain^$opts
+      seen.adguard++
+      var opts = m[2] ? m[2].split(",") : []
+      if (opts.some(function(o) { return !IMPORT_OPTIONS_OK[o.trim().replace(/^~/, "")] })) { out.skipped.options++; continue }
+      var ad = importDomain(m[1])
+      if (!ad) { out.skipped.other++; continue }
+      if (isAllow) allow[ad] = true; else block[ad] = true
+      continue
+    }
+    var pd = importDomain(line)
+    if (pd && !isAllow) {                                                        // bare domain (Pi-hole exact list)
+      seen.plain++
+      if (plainAs === "allow") allow[pd] = true; else block[pd] = true
+      continue
+    }
+    if (pd && isAllow) { allow[pd] = true; seen.adguard++; continue }
+    if (/[\\^$()|*+?\[\]{}]/.test(line)) out.skipped.regex++                    // Pi-hole regex lines
+    else out.skipped.other++
+  }
+  out.allow = Object.keys(allow).sort()
+  out.block = Object.keys(block).filter(function(d) { return !allow[d] }).sort()
+  out.format = seen.adguard ? "adguard" : seen.hosts ? "hosts" : seen.plain ? "domains" : "unknown"
+  return out
+}
+
 // Higher = more specific. app+host beats host-only beats app-only; a port
 // narrows any of them. Must match the nft ordering in buildSpec().
 function specificity(rule) {
