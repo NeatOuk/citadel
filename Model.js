@@ -158,12 +158,42 @@ function makeRule(fields) {
     host: normHost(f.host),
     port: normPort(f.port),
     action: f.action === "deny" ? "deny" : "allow",
+    // allow policies only: "default" (follow the default route), "direct",
+    // or a proxy id
+    route: f.route && f.route !== "" ? String(f.route) : "default",
     duration: f.duration === "untilQuit" ? "untilQuit" : "forever",
     pids: f.pids || [],
     exeHash: f.exeHash || "",
     note: f.note || "",
+    // who made it: "gate" (a verdict at the gate) or "you" (the policy form,
+    // Traffic, import). Older policies have none: only gate verdicts store
+    // the program's hash, so that tells them apart.
+    origin: f.origin === "gate" || f.origin === "you" ? f.origin : (f.exeHash ? "gate" : "you"),
     createdAt: f.createdAt || Math.floor(Date.now() / 1000)
   }
+}
+
+// The Policies list: search, "show" filter, zone and sort.
+// opts: {query, show: all|you|gate|deny|proxy, sort: newest|precedence, profile: "*all*"|name}
+function filterRules(rules, opts, proxyName) {
+  var o = opts || {}
+  var q = String(o.query || "").trim().toLowerCase()
+  var out = (rules || []).filter(function(r) {
+    if (o.profile && o.profile !== "*all*" && r.profile !== o.profile && r.profile !== "*") return false
+    var routed = r.action === "allow" && r.route && r.route !== "default" && r.route !== "direct"
+    if (o.show === "you" && r.origin !== "you") return false
+    if (o.show === "gate" && r.origin !== "gate") return false
+    if (o.show === "deny" && r.action !== "deny") return false
+    if (o.show === "proxy" && !routed) return false
+    if (!q) return true
+    var hay = [r.app, r.app.split("/").pop(), r.via && r.via !== "*" ? r.via + " " + viaLabel(r.via) : "",
+               r.host, String(r.port), routed && proxyName ? proxyName(r.route) : "", r.note || ""]
+      .join(" ").toLowerCase()
+    return q.split(/\s+/).every(function(w) { return hay.indexOf(w) !== -1 })
+  })
+  return out.slice().sort(o.sort === "precedence"
+    ? function(a, b) { return specificity(b) - specificity(a) || b.createdAt - a.createdAt }
+    : function(a, b) { return b.createdAt - a.createdAt })
 }
 
 // Higher = more specific. app+host beats host-only beats app-only; a port
@@ -240,19 +270,21 @@ function alertKey(conn) {
 }
 
 // Rule fields for an alert answer. scope: "hostPort" | "host" | "app"
-function ruleFromAlert(alert, action, scope, duration, profile, appInfo, viaScoped) {
+function ruleFromAlert(alert, action, scope, duration, profile, appInfo, viaScoped, route) {
   var conn = alert.conn
   var host = conn.host || conn.raddr
   return makeRule({
     profile: profile || "*",
     app: conn.exe || "*",
     via: viaScoped && conn.viaId ? conn.viaId : "*",
+    route: action === "allow" && route ? route : "default",
     host: scope === "app" ? "*" : host,
     port: scope === "hostPort" ? conn.rport : "*",
     action: action,
     duration: duration === "untilQuit" ? "untilQuit" : "forever",
     pids: duration === "untilQuit" && appInfo ? appInfo.pids || [] : [],
-    exeHash: appInfo && appInfo.trust ? appInfo.trust.hash || "" : ""
+    exeHash: appInfo && appInfo.trust ? appInfo.trust.hash || "" : "",
+    origin: "gate"
   })
 }
 
@@ -337,71 +369,91 @@ function userCgroup(cg, uid) {
 // Build the ordered spec that ls-enforcer turns into nftables rules.
 // Returns { spec, approx: {ruleId: true} } — approx marks app rules that can
 // only be enforced per destination because the app shares its cgroup.
-function buildSpec(rules, ctx, conns, apps, blocklistCidrs, uid) {
-  var entries = []
-  var approx = {}
+// Most specific first; deny before allow at equal specificity. Both the
+// firewall spec and the proxy routes use this order.
+function sortedActive(rules, ctx) {
   var active = (rules || []).filter(function(r) { return ruleActive(r, ctx) })
-  // most specific first; deny before allow at equal specificity
   active.sort(function(a, b) {
     var d = specificity(b) - specificity(a)
     if (d !== 0) return d
     return (a.action === "deny" ? 0 : 1) - (b.action === "deny" ? 0 : 1)
   })
+  return active
+}
+
+// What one policy matches right now, as helper match entries
+// [{cgroup?, targets?}]. Marks approx[rule.id] when the app shares its cgroup
+// and can only be matched per destination.
+function ruleTargets(r, ctx, conns, apps, uid, approx) {
+  var out = []
+  var hasApp = r.app && r.app !== "*"
+  var hasHost = r.host && r.host !== "*"
+  var port = r.port === "*" ? null : r.port
+  if (!hasApp) {
+    var t = hostTargets(r, conns, ctx.resolved, ctx.learned)
+    if (t.length) out.push({ targets: t })
+    return out
+  }
+  if (r.via && r.via !== "*") {
+    // The launcher's cgroup also holds the launcher itself, so a "via" rule
+    // can only be enforced per destination inside that cgroup.
+    approx[r.id] = true
+    var cgs = uniq(conns.filter(function(c) { return !c.system && c.exe === r.app && (c.viaId || "") === r.via })
+      .map(function(c) { return c.cgroup })
+      .concat(ctx.learnedCg && ctx.learnedCg[r.id] ? ctx.learnedCg[r.id] : []))
+      .filter(function(c) { return userCgroup(c, uid) }).sort()
+    var vt = hasHost ? hostTargets(r, conns, ctx.resolved, ctx.learned)
+      : uniq(conns.filter(function(c) { return c.exe === r.app && (c.viaId || "") === r.via }).map(function(c) { return c.raddr })
+          .concat(ctx.learned && ctx.learned[r.id] ? ctx.learned[r.id] : [])).sort()
+          .map(function(ip) { return { ip: ip, port: port } })
+    if (vt.length) for (var v = 0; v < cgs.length; v++) out.push({ cgroup: cgs[v], targets: vt })
+    return out
+  }
+  var info = apps ? apps[r.app] : null
+  if (!info) return out                            // app not running
+  var owned = (info.owned || []).filter(function(c) { return userCgroup(c, uid) })
+  var all = (info.cgroups || []).filter(function(c) { return userCgroup(c, uid) })
+  if (hasHost) {
+    var tg = hostTargets(r, conns, ctx.resolved, ctx.learned)
+    if (!tg.length) return out
+    for (var a = 0; a < all.length; a++) out.push({ cgroup: all[a], targets: tg })
+    if (all.length > owned.length) approx[r.id] = true
+    return out
+  }
+  // whole app (optionally one port: any address on that port)
+  var anyOnPort = port ? [{ ip: "0.0.0.0/0", port: port }, { ip: "::/0", port: port }] : null
+  for (var o = 0; o < owned.length; o++)
+    out.push(anyOnPort ? { cgroup: owned[o], targets: anyOnPort } : { cgroup: owned[o] })
+  var shared = all.filter(function(c) { return owned.indexOf(c) === -1 })
+  if (shared.length) {
+    approx[r.id] = true
+    // shared cgroup (e.g. a CLI inside a terminal): limit to what this app
+    // is talking to, inside that cgroup only
+    var dests = uniq(conns.filter(function(c) { return c.exe === r.app }).map(function(c) { return c.raddr })
+      .concat(ctx.learned && ctx.learned[r.id] ? ctx.learned[r.id] : [])).sort()
+    if (dests.length) {
+      for (var s = 0; s < shared.length; s++)
+        out.push({ cgroup: shared[s], targets: dests.map(function(ip) { return { ip: ip, port: port } }) })
+    }
+  }
+  return out
+}
+
+function buildSpec(rules, ctx, conns, apps, blocklistCidrs, uid) {
+  var entries = []
+  var approx = {}
+  var active = sortedActive(rules, ctx)
   var blocklistPlaced = false
   for (var i = 0; i < active.length; i++) {
     var r = active[i]
     var verdict = r.action === "deny" ? "drop" : "accept"
-    var hasApp = r.app && r.app !== "*"
-    var hasHost = r.host && r.host !== "*"
     // blocklists sit between host rules and app-only rules
-    if (!blocklistPlaced && !hasHost && hasApp) { entries.push({ blocklist: true }); blocklistPlaced = true }
-    if (!hasApp) {
-      var t = hostTargets(r, conns, ctx.resolved, ctx.learned)
-      if (t.length) entries.push({ verdict: verdict, targets: t })
-      continue
+    if (!blocklistPlaced && !(r.host && r.host !== "*") && r.app && r.app !== "*") {
+      entries.push({ blocklist: true }); blocklistPlaced = true
     }
-    if (r.via && r.via !== "*") {
-      // The launcher's cgroup also holds the launcher itself, so a "via" rule
-      // can only be enforced per destination inside that cgroup.
-      approx[r.id] = true
-      var cgs = uniq(conns.filter(function(c) { return !c.system && c.exe === r.app && (c.viaId || "") === r.via })
-        .map(function(c) { return c.cgroup })
-        .concat(ctx.learnedCg && ctx.learnedCg[r.id] ? ctx.learnedCg[r.id] : []))
-        .filter(function(c) { return userCgroup(c, uid) }).sort()
-      var vt = hasHost ? hostTargets(r, conns, ctx.resolved, ctx.learned)
-        : uniq(conns.filter(function(c) { return c.exe === r.app && (c.viaId || "") === r.via }).map(function(c) { return c.raddr })
-            .concat(ctx.learned && ctx.learned[r.id] ? ctx.learned[r.id] : [])).sort()
-            .map(function(ip) { return { ip: ip, port: r.port === "*" ? null : r.port } })
-      if (vt.length) for (var v = 0; v < cgs.length; v++) entries.push({ verdict: verdict, cgroup: cgs[v], targets: vt })
-      continue
-    }
-    var info = apps ? apps[r.app] : null
-    if (!info) continue                          // app not running
-    var owned = (info.owned || []).filter(function(c) { return userCgroup(c, uid) })
-    var all = (info.cgroups || []).filter(function(c) { return userCgroup(c, uid) })
-    if (hasHost) {
-      var tg = hostTargets(r, conns, ctx.resolved, ctx.learned)
-      if (!tg.length) continue
-      for (var a = 0; a < all.length; a++) entries.push({ verdict: verdict, cgroup: all[a], targets: tg })
-      if (all.length > owned.length) approx[r.id] = true
-      continue
-    }
-    // whole app
-    for (var o = 0; o < owned.length; o++) entries.push({ verdict: verdict, cgroup: owned[o] })
-    var shared = all.filter(function(c) { return owned.indexOf(c) === -1 })
-    if (shared.length) {
-      approx[r.id] = true
-      // shared cgroup (e.g. a CLI inside a terminal): limit to what this app
-      // is talking to, inside that cgroup only
-      var dests = uniq(conns.filter(function(c) { return c.exe === r.app }).map(function(c) { return c.raddr })
-        .concat(ctx.learned && ctx.learned[r.id] ? ctx.learned[r.id] : [])).sort()
-      var port = r.port === "*" ? null : r.port
-      if (dests.length) {
-        for (var s = 0; s < shared.length; s++)
-          entries.push({ verdict: verdict, cgroup: shared[s],
-                         targets: dests.map(function(ip) { return { ip: ip, port: port } }) })
-      }
-    }
+    ruleTargets(r, ctx, conns, apps, uid, approx).forEach(function(m) {
+      entries.push(Object.assign({ verdict: verdict }, m))
+    })
   }
   if (!blocklistPlaced) entries.push({ blocklist: true })
   return {
@@ -410,7 +462,105 @@ function buildSpec(rules, ctx, conns, apps, blocklistCidrs, uid) {
   }
 }
 
+// ------------------------------------------------------------------ proxy routes
+
+// Listener port for a route: "default" follows the default route, "direct"
+// is no port, a proxy id is that proxy's listener. A route naming a proxy
+// that no longer exists gets DEAD_PORT, which nothing listens on, so the
+// app fails closed instead of silently going direct.
+var DEAD_PORT = 47000
+function routePort(route, defaultRoute, proxiesById) {
+  if (!route || route === "default") route = defaultRoute || "direct"
+  if (route === "direct") return null
+  var px = proxiesById[route]
+  return px ? px.listen : DEAD_PORT
+}
+
+// Helper `proxy` section for the policies' routes and the default route, in
+// the same most-specific-first order as the firewall spec. Deny policies are
+// dropped by the filter chain before NAT, so they need no route. Returns
+// null when nothing is routed through a proxy.
+function compileRoutes(rules, defaultRoute, proxies, ctx, conns, apps, uid) {
+  var byId = {}
+  ;(proxies || []).forEach(function(p) { byId[p.id] = p })
+  var out = []
+  var any = false
+  var approx = {}
+  // Only policies that name a route (direct or a proxy) decide routing. A
+  // plain Allow has no say, so "Edge via Office" still covers an Edge
+  // destination that a narrower Allow let through; the rest takes the
+  // default route (catch-all below).
+  sortedActive(rules, ctx).forEach(function(r) {
+    if (r.action === "deny" || !r.route || r.route === "default") return
+    var port = routePort(r.route, defaultRoute, byId)
+    if (port !== null) any = true
+    ruleTargets(r, ctx, conns, apps, uid, approx).forEach(function(m) {
+      out.push(Object.assign(port === null ? { verdict: "direct" } : { verdict: "redirect", port: port }, m))
+    })
+  })
+  var defaultPort = routePort("default", defaultRoute, byId)
+  if (!any && defaultPort === null) return null
+  // never redirect the proxies' own traffic back into them
+  var exclude = []
+  ;(proxies || []).forEach(function(p) {
+    var ips = isAddressLike(p.host) ? [p.host] : ((ctx.resolved || {})[normHost(p.host)] || [])
+    ips.forEach(function(ip) { exclude.push(ip) })
+  })
+  return { rules: out, defaultPort: defaultPort, exclude: uniq(exclude).slice(0, 64) }
+}
+
+// Route label for a live connection: null (direct) or the proxy object.
+function routeFor(conn, rules, ctx, defaultRoute, proxies) {
+  if (!conn || conn.system) return null
+  var r = bestRule(conn, rules, ctx)
+  if (r && r.action === "deny") return null
+  // the most specific matching policy that names a route (see compileRoutes)
+  var routed = bestRule(conn, (rules || []).filter(function(x) {
+    return x.action === "allow" && x.route && x.route !== "default"
+  }), ctx)
+  var route = routed ? routed.route : (defaultRoute || "direct")
+  if (route === "direct") return null
+  var px = (proxies || []).filter(function(p) { return p.id === route })[0]
+  return px || { id: route, name: "missing proxy", missing: true }
+}
+
+// Lowest listener port >= 47001 not used by another proxy.
+function freeListenPort(proxies) {
+  var used = {}
+  ;(proxies || []).forEach(function(p) { used[p.listen] = true })
+  for (var port = 47001; port < 47100; port++) if (!used[port]) return port
+  return 0
+}
+
 // Live sockets to tear down after a deny: [{cgroup, ip}]
+// Live connections whose route just changed: a new or changed entry in the
+// helper's proxy section (e.g. an app newly sent via a proxy, or restarted
+// into a new scope). Cutting them makes the app reconnect along the new
+// route; connections that already existed would otherwise keep going the way
+// they started. Proxy servers themselves (exclude) are never cut.
+function routeCutTargets(prev, next, conns, uid) {
+  function key(e) { return JSON.stringify([e.verdict, e.port || 0, e.cgroup || "", e.targets || []]) }
+  var before = {}
+  ;((prev && prev.rules) || []).forEach(function(e) { before[key(e)] = true })
+  var changed = ((next && next.rules) || []).filter(function(e) { return !before[key(e)] })
+  var after = {}
+  ;((next && next.rules) || []).forEach(function(e) { after[key(e)] = true })
+  // entries that went away also move their traffic (e.g. back to direct)
+  changed = changed.concat(((prev && prev.rules) || []).filter(function(e) { return !after[key(e)] }))
+  if (!changed.length) return []
+  var exclude = ((next && next.exclude) || []).concat((prev && prev.exclude) || [])
+  return killTargets(conns, function(c) {
+    if (c.proto !== "tcp" || c.scope === "loopback") return false
+    if (exclude.some(function(x) { return netContains(x, c.raddr) })) return false
+    return changed.some(function(e) {
+      if (e.cgroup && e.cgroup !== c.cgroup) return false
+      if (!e.targets || !e.targets.length) return true
+      return e.targets.some(function(t) {
+        return netContains(t.ip, c.raddr) && (t.port === null || t.port === undefined || Number(t.port) === Number(c.rport))
+      })
+    })
+  }, uid)
+}
 function killTargets(conns, pred, uid) {
   var out = []
   for (var i = 0; i < conns.length; i++) {

@@ -16,9 +16,11 @@ Column {
   property string duration: "forever"      // forever | untilQuit
   // cover the app only when started by the same launcher (script / program)
   property bool viaScoped: viaDefault
+  property string route: "default"                  // for "Always allow"
 
   readonly property var conn: alert ? alert.conn : ({})
   readonly property var tr: alert ? (alert.trust || {}) : ({})
+  readonly property var ex: s && alert ? s.explanationOf(conn) : null
   readonly property int remaining: alert && s && Number(s.prefs.alertTimeout) > 0
     ? Math.max(0, Math.round(Number(s.prefs.alertTimeout) - (s.now - alert.firstSeen))) : -1
   readonly property bool hasVia: !!(conn && conn.via)
@@ -29,7 +31,7 @@ Column {
        : scope === "hostPort" ? Model.destLabel(conn) + " on port " + conn.rport : Model.destLabel(conn))
 
   spacing: Style.space(6)
-  onAlertChanged: { adjusting = false; scope = "host"; duration = "forever"; viaScoped = viaDefault }
+  onAlertChanged: { adjusting = false; scope = "host"; duration = "forever"; viaScoped = viaDefault; route = "default" }
 
   function integrity(t) {
     var l = t.level || "unknown"
@@ -40,7 +42,7 @@ Column {
     return { text: "integrity: unknown", bad: false, warn: true }
   }
   function verdict(action, duration) {
-    s.answer(alert.key, action, scope, duration, "", hasVia && viaScoped)
+    s.answer(alert.key, action, scope, duration, "", hasVia && viaScoped, route)
   }
 
   // who
@@ -144,6 +146,102 @@ Column {
               + String(root.conn.proto || "").toUpperCase() + " " + root.conn.rport
               + (Model.portName(root.conn.rport) ? " · " + Model.portName(root.conn.rport) : "")
       }
+      Lbl {
+        p: root.p
+        width: parent.width
+        visible: !!root.conn.org
+        dim: true
+        font.pixelSize: Style.font.caption
+        text: "Owner: " + (root.conn.org || "")
+        elide: Text.ElideRight
+      }
+    }
+  }
+
+  // explain: asks the user's own agent (on demand, cached)
+  Column {
+    width: parent.width
+    spacing: Style.space(2)
+    visible: !!root.s
+    RowLayout {
+      width: parent.width
+      spacing: Style.space(8)
+      visible: root.s.explainAvailable
+      LinkButton {
+        p: root.p
+        visible: !root.ex || root.ex.state !== "pending"
+        text: !root.ex ? "Explain" : "Ask again"
+        onClicked: root.s.explain(root.conn, !!root.ex)
+      }
+      Lbl {
+        p: root.p
+        visible: !!root.ex && root.ex.state === "pending"
+        dim: true
+        text: "Asking " + (root.ex ? root.ex.agent : "") + "…"
+        font.pixelSize: Style.font.caption
+      }
+      Lbl {
+        p: root.p
+        Layout.fillWidth: true
+        visible: !root.ex
+        dim: true
+        text: "Sends the app, host and masked command to " + root.s.explainAgent
+        font.pixelSize: Style.font.caption
+        elide: Text.ElideRight
+      }
+    }
+    Lbl {
+      p: root.p
+      width: parent.width
+      visible: !root.s.explainAvailable
+      dim: true
+      wrapMode: Text.WordWrap
+      maximumLineCount: 2
+      font.pixelSize: Style.font.caption
+      text: "Explain needs an Omarchy default agent (omarchy agent --pick) or a custom command in Settings."
+    }
+    Lbl {
+      p: root.p
+      width: parent.width
+      visible: !!root.ex && root.ex.state === "error"
+      color: root.p.urgent
+      wrapMode: Text.WordWrap
+      maximumLineCount: 3
+      font.pixelSize: Style.font.caption
+      text: root.ex && root.ex.error ? root.ex.error : ""
+    }
+    Lbl {
+      p: root.p
+      width: parent.width
+      visible: !!root.ex && root.ex.state === "done"
+      wrapMode: Text.WordWrap
+      maximumLineCount: 4
+      font.pixelSize: Style.font.bodySmall
+      readonly property var r: root.ex && root.ex.result ? root.ex.result : ({})
+      text: (r.service && r.service !== r.company ? r.service + " · " : "") + (r.company || "")
+            + (r.purpose ? " — " + r.purpose : "") + (r.category ? " (" + r.category + ")" : "")
+    }
+    Lbl {
+      p: root.p
+      width: parent.width
+      visible: !!root.ex && root.ex.state === "done"
+      readonly property var r: root.ex && root.ex.result ? root.ex.result : ({})
+      color: r.suggestion === "block" ? root.p.urgent : root.p.foreground
+      wrapMode: Text.WordWrap
+      maximumLineCount: 3
+      font.pixelSize: Style.font.caption
+      text: "Suggests: " + (r.suggestion === "either" ? "your call" : r.suggestion === "block" ? "Block" : "Allow")
+            + (r.why ? " — " + r.why : "") + "   risk " + (r.risk || "?")
+            + (r.confidence === "low" ? " · unsure" : "")
+    }
+    Lbl {
+      p: root.p
+      width: parent.width
+      visible: !!root.ex && root.ex.state === "done"
+      dim: true
+      font.pixelSize: Style.font.caption
+      elide: Text.ElideRight
+      text: root.ex ? "by " + root.ex.agent + (root.ex.model ? " · " + root.ex.model : "") + (root.ex.cached ? " · saved answer" : "") : ""
     }
   }
 
@@ -224,6 +322,18 @@ Column {
       fontFamily: root.p.fontFamily
       fontSize: Style.font.caption
       onChanged: function(v) { root.viaScoped = v === "via" }
+    }
+    Lbl { p: root.p; dim: true; visible: root.s.proxies.length > 0; text: "Always allow routes it"; font.pixelSize: Style.font.caption }
+    ButtonGroup {
+      visible: root.s.proxies.length > 0
+      options: [{ value: "default", label: root.s.defaultRoute === "direct" ? "Default (direct)" : "Default (" + root.s.proxyName(root.s.defaultRoute) + ")" },
+                { value: "direct", label: "Direct" }]
+               .concat(root.s.proxies.map(function(x) { return { value: x.id, label: "via " + x.name } }))
+      value: root.route
+      foreground: root.p.foreground
+      fontFamily: root.p.fontFamily
+      fontSize: Style.font.caption
+      onChanged: function(v) { root.route = v }
     }
     Lbl { p: root.p; dim: true; text: "Lasts"; font.pixelSize: Style.font.caption }
     ButtonGroup {

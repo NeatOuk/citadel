@@ -14,6 +14,8 @@ Column {
   property var expanded: ({})
   property string killArmed: ""            // group key waiting for the confirming click
   property var killed: ({})                // group key -> {pids, ts} after a kill
+  property string tab: "apps"               // apps | proxy
+  readonly property string shownTab: tab === "proxy" && s.proxies.length > 0 ? "proxy" : "apps"
 
   spacing: Style.space(8)
 
@@ -67,6 +69,21 @@ Column {
     expanded = e
   }
 
+  ButtonGroup {
+    visible: root.s.proxies.length > 0
+    options: [{ value: "apps", label: "Apps" }, { value: "proxy", label: "Proxy" }]
+    value: root.shownTab
+    foreground: root.p.foreground
+    fontFamily: root.p.fontFamily
+    fontSize: Style.font.caption
+    onChanged: function(v) { root.tab = v }
+  }
+
+  Column {
+  id: appsTab
+  visible: root.shownTab === "apps"
+  width: parent.width
+  spacing: Style.space(8)
   // ---------------------------------------------------------------- stats
   GridLayout {
     width: parent.width
@@ -200,60 +217,12 @@ Column {
 
       Repeater {
         model: grp.open ? grp.modelData.conns : []
-        delegate: RowLayout {
+        delegate: ConnRow {
           required property var modelData
-          readonly property var d: root.s.decisions[modelData.key]
           width: grp.width
-          spacing: Style.space(6)
-          Item { width: Style.space(9) }
-          Rectangle {
-            width: Style.space(5); height: width; radius: width / 2
-            color: root.statusColor(parent.d)
-          }
-          Column {
-            Layout.fillWidth: true
-            spacing: 0
-            Lbl {
-              p: root.p
-              width: parent.width
-              text: (modelData.cc ? Model.flag(modelData.cc) + " " : "") + Model.destLabel(modelData)
-                    + ":" + modelData.rport
-              elide: Text.ElideMiddle
-            }
-            Lbl {
-              p: root.p
-              width: parent.width
-              dim: true
-              font.pixelSize: Style.font.caption
-              text: modelData.proto.toUpperCase()
-                    + (modelData.state === "syn-sent" ? " · connecting" : "")
-                    + (modelData.host ? " · " + modelData.raddr : "")
-                    + " · ↓" + Model.humanBytes(modelData.down) + " ↑" + Model.humanBytes(modelData.up)
-                    + " · " + root.statusText(parent.parent.d)
-            }
-            Lbl {
-              p: root.p
-              width: parent.width
-              visible: !!modelData.cmd && !!grp.modelData.viaId
-              dim: true
-              font.pixelSize: Style.font.caption
-              elide: Text.ElideMiddle
-              text: "$ " + modelData.cmd
-            }
-          }
-          LinkButton {
-            p: root.p
-            visible: !modelData.system
-            text: "Allow"
-            onClicked: root.s.allowConn(modelData)
-          }
-          LinkButton {
-            p: root.p
-            danger: true
-            visible: !modelData.system
-            text: "Block"
-            onClicked: root.s.denyConn(modelData)
-          }
+          p: root.p; s: root.s; view: root
+          conn: modelData
+          showCmd: !!grp.modelData.viaId
         }
       }
     }
@@ -334,4 +303,7 @@ Column {
     dim: true
     text: root.s.monitorUp ? "Nothing is leaving right now." : "The watch is starting…"
   }
+  }
+
+  ProxyTab { visible: root.shownTab === "proxy"; width: parent.width; p: root.p; s: root.s; view: root }
 }

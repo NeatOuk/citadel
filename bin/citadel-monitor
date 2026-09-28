@@ -38,6 +38,7 @@ STATE = os.path.join(HOME, ".local/share/citadel")
 LISTS_DIR = os.path.join(STATE, "lists")
 GEO_DIR = os.path.join(STATE, "geo")
 GEO_DB = os.path.join(GEO_DIR, "dbip-country-lite.mmdb")
+ASN_DB = os.path.join(GEO_DIR, "dbip-asn-lite.mmdb")
 HISTORY_DB = os.path.join(STATE, "history.db")
 MY_UID = os.getuid()
 UA = "citadel/1.0"
@@ -167,13 +168,22 @@ def proc_table():
     return table
 
 
+SHARED_BIN_DIRS = {"/usr/bin", "/bin", "/usr/sbin", "/sbin", "/usr/local/bin", "/usr/local/sbin",
+                   os.path.join(HOME, ".local/bin"), os.path.join(HOME, "bin"), os.path.join(HOME, ".cargo/bin")}
+
+
 def apps_from(table):
     """exe -> {pids, cgroups, owned}: a cgroup is 'owned' by an exe when every
     process in it is that exe or lives in the same directory (helpers such as
     chrome_crashpad_handler). Only owned cgroups are safe to block whole."""
     by_cg = {}
     for pid, (exe, cg) in table.items():
-        by_cg.setdefault(cg, set()).add(exe.replace(" (deleted)", ""))
+        clean = exe.replace(" (deleted)", "")
+        # helpers that never use the network (e.g. the `cat` pipes Edge's
+        # launcher leaves behind) don't make an app's scope shared; shells do
+        if os.path.basename(clean) in HELPERS:
+            continue
+        by_cg.setdefault(cg, set()).add(clean)
     apps = {}
     for pid, (exe, cg) in table.items():
         clean = exe.replace(" (deleted)", "")
@@ -185,8 +195,11 @@ def apps_from(table):
             a["deleted"] = True
     for exe, a in apps.items():
         base = os.path.dirname(exe)
+        # an app's own folder (/opt/microsoft/msedge) groups its helpers; a
+        # shared one (/usr/bin) says nothing: curl and bash are not one app
+        own_dir = base not in SHARED_BIN_DIRS
         for cg in a["cgroups"]:
-            if cg and all(e == exe or os.path.dirname(e) == base for e in by_cg.get(cg, ())):
+            if cg and all(e == exe or (own_dir and os.path.dirname(e) == base) for e in by_cg.get(cg, ())):
                 a["owned"].add(cg)
     return apps
 
@@ -326,31 +339,37 @@ def resolve_hosts(force=False):
 
 # ------------------------------------------------------------------ GeoIP
 
-geo = {"reader": None, "mtime": 0, "error": ""}
+# Two DB-IP Lite databases (CC BY 4.0): country, and the network owner (ASN)
+# of each IP, e.g. "Google LLC". Both are downloaded together.
+GEO_DBS = {"country": GEO_DB, "asn": ASN_DB}
+geo = {k: {"reader": None, "mtime": 0} for k in GEO_DBS}
+geo_error = {"msg": ""}
 
 
-def geo_reader():
+def geo_reader(kind="country"):
+    g = geo[kind]
     try:
-        mt = os.path.getmtime(GEO_DB)
+        mt = os.path.getmtime(GEO_DBS[kind])
     except OSError:
-        geo["reader"] = None
+        g["reader"] = None
         return None
-    if geo["reader"] is None or mt != geo["mtime"]:
+    if g["reader"] is None or mt != g["mtime"]:
         try:
             import maxminddb
-            geo["reader"] = maxminddb.open_database(GEO_DB)
-            geo["mtime"] = mt
-            geo["error"] = ""
+            g["reader"] = maxminddb.open_database(GEO_DBS[kind])
+            g["mtime"] = mt
+            geo_error["msg"] = ""
         except ImportError:
-            geo["error"] = "python-maxminddb is not installed"
-            geo["reader"] = None
+            geo_error["msg"] = "python-maxminddb is not installed"
+            g["reader"] = None
         except Exception as e:                           # corrupt file
-            geo["error"] = str(e)[:200]
-            geo["reader"] = None
-    return geo["reader"]
+            geo_error["msg"] = str(e)[:200]
+            g["reader"] = None
+    return g["reader"]
 
 
 geo_cache = {}
+org_cache = {}
 
 
 def country(ip):
@@ -369,38 +388,72 @@ def country(ip):
     return cc
 
 
+def owner(ip):
+    """Network owner of an IP from the ASN database, e.g. "Google LLC"."""
+    if ip in org_cache:
+        return org_cache[ip]
+    r = geo_reader("asn")
+    org = ""
+    if r and classify(ip) == "internet":
+        try:
+            org = (r.get(ip) or {}).get("autonomous_system_organization") or ""
+        except Exception:
+            org = ""
+    if r:
+        if len(org_cache) > 20000:
+            org_cache.clear()
+        org_cache[ip] = org
+    return org
+
+
 def geo_status():
     r = geo_reader()
-    st = {"type": "geoip", "installed": r is not None, "error": geo["error"]}
+    st = {"type": "geoip", "installed": r is not None, "owner": geo_reader("asn") is not None,
+          "error": geo_error["msg"]}
     if r is not None:
-        st["updated"] = int(geo["mtime"])
+        st["updated"] = int(geo["country"]["mtime"])
     emit(st)
 
 
-def geo_download():
+def geo_fetch(name, path):
+    """Download this month's (else last month's) DB-IP Lite `name` database."""
+    last = None
+    for months_back in (0, 1):
+        d = datetime.date.today().replace(day=1) - datetime.timedelta(days=31 * months_back)
+        url = "https://download.db-ip.com/free/dbip-%s-lite-%04d-%02d.mmdb.gz" % (name, d.year, d.month)
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = gzip.decompress(resp.read())
+            tmp = path + ".tmp"
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.replace(tmp, path)
+            return None
+        except Exception as e:
+            last = e
+    return last
+
+
+def geo_download(only_missing=False):
     def run():
         try:
             os.makedirs(GEO_DIR, exist_ok=True)
-            last = None
-            for months_back in (0, 1):
-                d = datetime.date.today().replace(day=1) - datetime.timedelta(days=31 * months_back)
-                url = "https://download.db-ip.com/free/dbip-country-lite-%04d-%02d.mmdb.gz" % (d.year, d.month)
-                try:
-                    req = urllib.request.Request(url, headers={"User-Agent": UA})
-                    with urllib.request.urlopen(req, timeout=60) as resp:
-                        data = gzip.decompress(resp.read())
-                    tmp = GEO_DB + ".tmp"
-                    with open(tmp, "wb") as f:
-                        f.write(data)
-                    os.replace(tmp, GEO_DB)
-                    geo_cache.clear()
-                    geo["reader"] = None
-                    geo_status()
-                    return
-                except Exception as e:
-                    last = e
-            emit({"type": "geoip", "installed": geo_reader() is not None,
-                  "error": "download failed: %s" % last})
+            errors = []
+            for name, kind in (("country", "country"), ("asn", "asn")):
+                if only_missing and os.path.exists(GEO_DBS[kind]):
+                    continue
+                err = geo_fetch(name, GEO_DBS[kind])
+                if err:
+                    errors.append("%s: %s" % (name, err))
+                geo[kind]["reader"] = None
+            geo_cache.clear()
+            org_cache.clear()
+            if errors:
+                emit({"type": "geoip", "installed": geo_reader() is not None, "owner": geo_reader("asn") is not None,
+                      "error": "download failed: " + "; ".join(errors)})
+            else:
+                geo_status()
         except Exception as e:
             emit({"type": "geoip", "installed": False, "error": str(e)[:200]})
     threading.Thread(target=run, daemon=True).start()
@@ -1096,6 +1149,8 @@ NON_NETWORK = SHELLS | {"sleep", "cat", "grep", "sed", "awk", "head", "tail", "t
                         "uniq", "wc", "jq", "date", "printf", "echo", "test", "[", "true", "false",
                         "basename", "dirname", "readlink", "mkdir", "rm", "mv", "cp", "ls", "stat",
                         "notify-send", "hyprctl", "pgrep", "ps", "id", "env", "tee", "xargs"}
+# utilities that can't open a connection; shells excluded (they run tools)
+HELPERS = NON_NETWORK - SHELLS
 
 
 def attribute(ev):
@@ -1164,7 +1219,7 @@ def short_connections(conns, prev_keys):
             "pid": (rec or {}).get("pid", 0), "exe": exe,
             "app": os.path.basename(exe) if exe else ("short-lived process" if rec else "unknown"),
             "cgroup": (rec or {}).get("cgroup", ""), "system": False, "scope": classify(ev["dst"]),
-            "host": host or "", "cc": country(ev["dst"]), "up": 0, "down": 0, "upRate": 0, "downRate": 0,
+            "host": host or "", "cc": country(ev["dst"]), "org": owner(ev["dst"]), "up": 0, "down": 0, "upRate": 0, "downRate": 0,
             "new": True, "list": list_match(host, ev["dst"]), "guess": guess,
             "via": v.get("name", ""), "viaId": v.get("id", ""), "viaKind": v.get("kind", ""),
             "cmd": o.get("cmd", ""), "chain": o.get("chain", []), "unit": o.get("unit", "")})
@@ -1215,10 +1270,13 @@ def tick(hist, prev, table_cache):
              "raddr": r["raddr"], "rport": r["rport"], "lport": r["lport"],
              "pid": r["pid"], "exe": exe, "app": app_name(exe, r["comm"], r["cgroup"]),
              "cgroup": r["cgroup"].lstrip("/"), "system": system, "scope": kind,
-             "host": host or "", "cc": country(r["raddr"]),
+             "host": host or "", "cc": country(r["raddr"]), "org": owner(r["raddr"]),
              "up": r["up"], "down": r["down"], "upRate": up_rate, "downRate": down_rate,
              "new": p is None, "list": list_match(host, r["raddr"]) if not system else ""}
         c.update(origin_fields(r["pid"], r["cgroup"]) if (r["pid"] and not system) else EMPTY_ORIGIN)
+        if "/bin/citadel-proxy" in c["cmd"]:
+            # Citadel's own proxy tunnels: the app's side is shown separately
+            c.update(app="Citadel proxy", via="", viaId="", viaKind="")
         conns.append(c)
     nextprev = {c["key"]: {"ts": now, "up": c["up"], "down": c["down"],
                            "sock": (c["lport"], c["raddr"], c["rport"])} for c in conns}
@@ -1275,6 +1333,8 @@ def main():
     hist = History()
     prev = {}
     geo_status()
+    if geo_reader() is not None and geo_reader("asn") is None:
+        geo_download(only_missing=True)        # installs from before the owner database
     last_stats = last_resolve = last_lists = 0
     buf = b""
     next_tick = time.time()

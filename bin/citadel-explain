@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""Citadel explain: ask the user's own agent what a connection is for.
+
+stdin:  {"conn": {app, exe, via, cmd, host, raddr, rport, proto, cc, org},
+         "prefs": {"explainCommand": "", "explainModel": ""}, "fresh": false}
+        or {"test": true, "prefs": {...}} for the Settings "Test" button
+stdout: {"ok": true, "result": {...}, "agent": "claude", "model": "", "cached": false}
+        {"ok": false, "error": "...", "code": "no-agent"|"unsupported"|"failed", "agent": ...}
+
+Which agent answers:
+  1. prefs.explainCommand, a user template such as `mytool --print {prompt}`
+  2. otherwise the user's Omarchy default agent (~/.config/omarchy/defaults/agent)
+     through its own one-shot mode (see ADAPTERS)
+  3. otherwise nothing: code "no-agent"
+Answers are cached for 30 days per app + registrable domain (or IP) + port.
+Only the standard library is used.
+"""
+import json
+import os
+import re
+import shlex
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+
+HOME = os.path.expanduser("~")
+AGENT_FILE = os.environ.get("CITADEL_AGENT_FILE") or os.path.join(HOME, ".config/omarchy/defaults/agent")
+CACHE_DB = os.environ.get("CITADEL_EXPLAIN_DB") or os.path.join(HOME, ".local/share/citadel/history.db")
+HELP_CACHE = os.path.join(HOME, ".cache/citadel/agent-help.json")
+TIMEOUT = 120
+CACHE_DAYS = 30
+# Omarchy installs agents through mise; the shell's PATH may not include it
+EXTRA_PATH = [os.path.join(HOME, p) for p in (".local/share/mise/shims", ".local/bin", ".bun/bin", ".cargo/bin",
+                                               ".npm-global/bin")]
+
+CATEGORIES = ["ads", "analytics", "telemetry", "cdn", "api", "updates", "auth", "content", "social", "other"]
+SCHEMA = {
+    "type": "object",
+    "properties": {
+        "company": {"type": "string", "description": "organisation operating the destination"},
+        "service": {"type": "string", "description": "product or service behind the host"},
+        "purpose": {"type": "string", "description": "what this connection is most likely for, one short sentence"},
+        "category": {"type": "string", "enum": CATEGORIES},
+        "risk": {"type": "string", "enum": ["low", "medium", "high"]},
+        "suggestion": {"type": "string", "enum": ["allow", "block", "either"]},
+        "why": {"type": "string", "description": "one short reason for the suggestion"},
+        "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+    },
+    "required": ["company", "service", "purpose", "category", "risk", "suggestion", "why", "confidence"],
+    "additionalProperties": False,
+}
+
+# One-shot mode per agent: (binary, argv builder, flags that must be in --help,
+# model flag or None, how to read the answer: "claude-json" | "text").
+ADAPTERS = {
+    "claude": ("claude", lambda p: ["-p", "--output-format", "json", "--json-schema", json.dumps(SCHEMA),
+                                    "--tools", "", "--strict-mcp-config", "--no-session-persistence", p],
+               ["--print", "--json-schema", "--no-session-persistence"], "--model", "claude-json"),
+    "pi": ("pi", lambda p: ["-p", "--no-session", "--no-tools", p], ["--no-session", "--no-tools"], "--model", "text"),
+    "codex": ("codex", lambda p: ["exec", p], ["exec"], "--model", "text"),
+    "opencode": ("opencode", lambda p: ["run", p], ["run"], "--model", "text"),
+    "gemini": ("gemini", lambda p: ["-p", p], ["--prompt"], "--model", "text"),
+    "crush": ("crush", lambda p: ["run", p], ["run"], None, "text"),
+    "copilot": ("copilot", lambda p: ["-p", p], ["--prompt"], "--model", "text"),
+    "cursor-agent": ("cursor-agent", lambda p: ["-p", "--output-format", "text", p], ["--print"], "--model", "text"),
+}
+
+
+def out(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+# ------------------------------------------------------------------ agent
+
+def default_agent():
+    try:
+        with open(AGENT_FILE) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def which(binary):
+    found = shutil.which(binary)
+    if found:
+        return found
+    for d in EXTRA_PATH:
+        p = os.path.join(d, binary)
+        if os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def help_text(path):
+    """`<agent> --help`, cached per binary (path + mtime)."""
+    try:
+        key = "%s:%d" % (path, os.stat(path).st_mtime_ns)
+    except OSError:
+        return ""
+    try:
+        with open(HELP_CACHE) as f:
+            cache = json.load(f)
+    except (OSError, ValueError):
+        cache = {}
+    if key in cache:
+        return cache[key]
+    try:
+        p = subprocess.run([path, "--help"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=20)
+        text = p.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        text = ""
+    cache = {k: v for k, v in cache.items() if not k.startswith(path + ":")}
+    cache[key] = text
+    try:
+        os.makedirs(os.path.dirname(HELP_CACHE), exist_ok=True)
+        with open(HELP_CACHE, "w") as f:
+            json.dump(cache, f)
+    except OSError:
+        pass
+    return text
+
+
+def command_for(prefs, prompt):
+    """-> (argv, agent label, model label, parser) or raises LookupError(code, msg)."""
+    custom = (prefs.get("explainCommand") or "").strip()
+    model = (prefs.get("explainModel") or "").strip()
+    if custom:
+        parts = shlex.split(custom)
+        if not parts:
+            raise LookupError("unsupported", "The custom Explain command is empty.")
+        argv = [prompt if a == "{prompt}" else a.replace("{prompt}", prompt) for a in parts]
+        if "{prompt}" not in custom:
+            argv.append(prompt)
+        exe = which(argv[0]) or argv[0]
+        return [exe] + argv[1:], "custom command", "", "text"
+    agent = default_agent()
+    if not agent:
+        raise LookupError("no-agent", "No Omarchy default agent is set. Pick one with `omarchy agent --pick`, "
+                                      "or set a custom Explain command in Settings.")
+    if agent not in ADAPTERS:
+        raise LookupError("unsupported", "Explain isn't available for %s yet. Set a custom Explain command in Settings." % agent)
+    binary, build, needed, model_flag, parser = ADAPTERS[agent]
+    path = which(binary)
+    if not path:
+        raise LookupError("unsupported", "%s is your default agent but isn't installed or not on PATH." % agent)
+    text = help_text(path)
+    missing = [f for f in needed if f not in text]
+    if missing:
+        raise LookupError("unsupported", "This version of %s lacks %s; set a custom Explain command in Settings."
+                                         % (agent, ", ".join(missing)))
+    argv = build(prompt)
+    if model and model_flag and model_flag in text:
+        argv = argv[:-1] + [model_flag, model, argv[-1]]
+    return [path] + argv, agent, model, parser
+
+
+# ------------------------------------------------------------------ prompt / parse
+
+PORTS = {22: "ssh", 25: "smtp", 53: "dns", 80: "http", 123: "ntp", 443: "https", 465: "smtps", 587: "smtp",
+         853: "dns over tls", 993: "imaps", 5228: "google push"}
+
+
+def build_prompt(c):
+    lines = [
+        "You identify outbound network connections for a desktop firewall (Citadel on Linux).",
+        "Say which company operates the destination, which product or service it is, and what the",
+        "connection is most likely for. Suggest allow or block from a privacy and security view.",
+        "If you are unsure, say so and set confidence to low. Do not use tools. Reply with ONLY one",
+        "JSON object with exactly these keys: company, service, purpose, category (one of %s)," % "|".join(CATEGORIES),
+        "risk (low|medium|high), suggestion (allow|block|either), why, confidence (low|medium|high).",
+        "",
+        "Connection:",
+        "- app: %s" % (c.get("app") or "unknown"),
+        "- program: %s" % (c.get("exe") or "unknown"),
+    ]
+    if c.get("via"):
+        lines.append("- started by: %s" % c["via"])
+    if c.get("cmd"):
+        lines.append("- command (secrets masked): %s" % c["cmd"][:300])
+    lines += [
+        "- destination host: %s" % (c.get("host") or "(no name known)"),
+        "- destination IP: %s" % c.get("raddr", ""),
+        "- port: %s%s" % (c.get("rport", ""), " (%s)" % PORTS[c.get("rport")] if c.get("rport") in PORTS else ""),
+        "- protocol: %s" % (c.get("proto") or "tcp"),
+    ]
+    if c.get("org"):
+        lines.append("- network owner (from the IP): %s" % c["org"])
+    if c.get("cc"):
+        lines.append("- country: %s" % c["cc"])
+    return "\n".join(lines)
+
+
+def first_json_object(text):
+    """The first {...} in text that parses as a JSON object."""
+    for m in re.finditer(r"\{", text):
+        depth, inside, esc = 0, False, False
+        for i in range(m.start(), len(text)):
+            ch = text[i]
+            if inside:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    inside = False
+            elif ch == '"':
+                inside = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        obj = json.loads(text[m.start():i + 1])
+                        if isinstance(obj, dict):
+                            return obj
+                    except ValueError:
+                        pass
+                    break
+    return None
+
+
+def normalise(obj):
+    def pick(v, allowed, default):
+        v = str(v or "").strip().lower()
+        return v if v in allowed else default
+    return {
+        "company": str(obj.get("company") or "").strip()[:120] or "Unknown",
+        "service": str(obj.get("service") or "").strip()[:120],
+        "purpose": str(obj.get("purpose") or "").strip()[:300],
+        "category": pick(obj.get("category"), CATEGORIES, "other"),
+        "risk": pick(obj.get("risk"), ["low", "medium", "high"], "medium"),
+        "suggestion": pick(obj.get("suggestion"), ["allow", "block", "either"], "either"),
+        "why": str(obj.get("why") or "").strip()[:300],
+        "confidence": pick(obj.get("confidence"), ["low", "medium", "high"], "low"),
+    }
+
+
+def parse(parser, stdout):
+    if parser == "claude-json":
+        try:
+            d = json.loads(stdout)
+        except ValueError:
+            d = None
+        if isinstance(d, dict):
+            if d.get("is_error"):
+                raise ValueError(str(d.get("result") or "the agent reported an error")[:200])
+            so = d.get("structured_output")
+            if isinstance(so, dict):
+                return so, ",".join((d.get("modelUsage") or {}).keys())
+            obj = first_json_object(str(d.get("result") or ""))
+            if obj:
+                return obj, ",".join((d.get("modelUsage") or {}).keys())
+    obj = first_json_object(stdout)
+    if obj is None:
+        raise ValueError("the agent's answer had no JSON in it")
+    return obj, ""
+
+
+# ------------------------------------------------------------------ cache
+
+def registrable(host):
+    host = (host or "").lower().rstrip(".")
+    parts = host.split(".")
+    if len(parts) <= 2:
+        return host
+    if len(parts[-1]) == 2 and parts[-2] in ("co", "com", "org", "net", "ac", "gov", "edu", "ne", "or", "go"):
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
+
+
+def cache_key(c):
+    return "%s|%s|%s" % (c.get("exe") or c.get("app") or "?", registrable(c.get("host")) or c.get("raddr", ""), c.get("rport", ""))
+
+
+def db():
+    os.makedirs(os.path.dirname(CACHE_DB), exist_ok=True)
+    con = sqlite3.connect(CACHE_DB, timeout=10)
+    con.execute("CREATE TABLE IF NOT EXISTS explanations (key TEXT PRIMARY KEY, ts REAL, agent TEXT, model TEXT, json TEXT)")
+    return con
+
+
+# ------------------------------------------------------------------ main
+
+TEST_CONN = {"app": "curl", "exe": "/usr/bin/curl", "host": "ad.doubleclick.net", "raddr": "142.250.72.166",
+             "rport": 443, "proto": "tcp", "org": "Google LLC"}
+
+
+def main():
+    try:
+        req = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        out({"ok": False, "code": "failed", "error": "bad request"})
+        return 1
+    prefs = req.get("prefs") or {}
+    conn = TEST_CONN if req.get("test") else (req.get("conn") or {})
+    key = cache_key(conn)
+    if not req.get("test") and not req.get("fresh"):
+        try:
+            con = db()
+            row = con.execute("SELECT ts, agent, model, json FROM explanations WHERE key = ?", (key,)).fetchone()
+            if row and time.time() - row[0] < CACHE_DAYS * 86400:
+                out({"ok": True, "result": json.loads(row[3]), "agent": row[1], "model": row[2], "cached": True, "key": key})
+                return 0
+        except (sqlite3.Error, ValueError):
+            pass
+    prompt = build_prompt(conn)
+    try:
+        argv, agent, model, parser = command_for(prefs, prompt)
+    except LookupError as e:
+        out({"ok": False, "code": e.args[0], "error": e.args[1], "agent": default_agent(), "key": key})
+        return 0
+    try:
+        with tempfile.TemporaryDirectory(prefix="citadel-explain-") as tmp:
+            p = subprocess.run(argv, cwd=tmp, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True, timeout=TIMEOUT)
+        if p.returncode != 0 and not p.stdout.strip():
+            raise ValueError((p.stderr.strip().splitlines() or ["exit %d" % p.returncode])[-1][:200])
+        obj, used_model = parse(parser, p.stdout)
+        result = normalise(obj)
+    except subprocess.TimeoutExpired:
+        out({"ok": False, "code": "failed", "error": "%s took longer than %ds" % (agent, TIMEOUT), "agent": agent, "key": key})
+        return 0
+    except (OSError, ValueError) as e:
+        out({"ok": False, "code": "failed", "error": str(e)[:200], "agent": agent, "key": key})
+        return 0
+    model = model or used_model
+    if not req.get("test"):
+        try:
+            con = db()
+            con.execute("INSERT OR REPLACE INTO explanations VALUES (?, ?, ?, ?, ?)",
+                        (key, time.time(), agent, model, json.dumps(result)))
+            con.execute("DELETE FROM explanations WHERE ts < ?", (time.time() - CACHE_DAYS * 86400,))
+            con.commit()
+        except sqlite3.Error:
+            pass
+    out({"ok": True, "result": result, "agent": agent, "model": model, "cached": False, "key": key})
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

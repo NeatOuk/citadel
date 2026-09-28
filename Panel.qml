@@ -6,6 +6,7 @@ import Quickshell.Io
 import qs.Commons
 import qs.Ui
 import "Model.js" as Model
+import "Registry.js" as Registry
 import "views"
 
 // Citadel: outbound firewall for the Omarchy bar. Bar tower icon, the
@@ -47,6 +48,13 @@ Panel {
   }
 
   function scrollToTop() { panelFlick.contentY = 0 }
+  function openPolicy(id) {
+    var r = citadel.rules.filter(function(x) { return x.id === id })[0]
+    if (!r) return false
+    root.view = "policies"; root.open()
+    Qt.callLater(function() { policiesView.edit(r) })
+    return true
+  }
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -59,11 +67,23 @@ Panel {
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
-  Service {
-    id: citadel
-    settings: root.settings
-    pluginDir: root.pluginDir
-    onOpenRequested: function(v) { root.view = v; root.open() }
+  // One Service per shell, shared by the widget on every screen (Registry.js).
+  Component { id: serviceComp; Service { objectName: "citadel-service" } }
+  property var _own: null                       // the Service this widget runs, if any
+  readonly property bool hostsService: !!_own && _own === citadel
+  property var citadel: _acquire()
+  function _acquire() {
+    if (Registry.alive(Registry.service)) return Registry.service
+    _own = serviceComp.createObject(root, { settings: Qt.binding(function() { return root.settings }),
+                                            pluginDir: root.pluginDir })
+    Registry.service = _own
+    return _own
+  }
+  // the widget that ran it went away (screen unplugged, bar reload): take over
+  Timer { interval: 2000; repeat: true; running: true; onTriggered: if (!Registry.alive(root.citadel)) root.citadel = root._acquire() }
+  Connections {
+    target: root.citadel
+    function onOpenRequested(v) { if (root.hostsService) { root.view = v; root.open() } }
   }
 
   IpcHandler {
@@ -83,14 +103,21 @@ Panel {
     }
     function removeRule(id: string): void { citadel.removeRule(id) }
     // open Policies with the form filled for one policy (same path as its Edit button)
-    function editPolicy(id: string): bool {
-      var r = citadel.rules.filter(function(x) { return x.id === id })[0]
-      if (!r) return false
-      root.view = "policies"; root.open()
-      Qt.callLater(function() { policiesView.edit(r) })
-      return true
-    }
+    function editPolicy(id: string): bool { return root.openPolicy(id) }
+    function trafficTab(name: string): void { trafficView.tab = name; root.view = "traffic"; root.open() }
     function rules(): string { return JSON.stringify(citadel.rules) }
+    // proxies: saveProxy('{"name","type","host","port"}', user, password) -> "" or an error
+    function proxies(): string {
+      return JSON.stringify({ proxies: citadel.proxies, defaultRoute: citadel.defaultRoute, status: citadel.proxyStatus,
+                              check: citadel.proxyCheck, log: citadel.proxyLog.slice(0, 10), error: citadel.proxyError,
+                              proxyCapable: citadel.proxyCapable })
+    }
+    function saveProxy(json: string, user: string, password: string): string {
+      try { return citadel.saveProxy(JSON.parse(json), user, password) } catch (e) { return "error: " + e }
+    }
+    function removeProxy(id: string): void { citadel.removeProxy(id) }
+    function checkProxy(id: string): void { citadel.checkProxy(id) }
+    function setDefaultRoute(route: string): void { citadel.setDefaultRoute(route) }
     // what Kill would hit for an app group ("exe" or "exe|launcher-id"), and do it
     function killable(key: string): string {
       var g = citadel.groups.filter(function(x) { return x.key === key })[0]
@@ -107,6 +134,24 @@ Panel {
     function lists(): string { return JSON.stringify({ lists: citadel.lists, status: citadel.listStatus, ipCidrs: citadel.ipCidrs.length }) }
     function downloadGeoip(): void { citadel.downloadGeoip() }
     function geoip(): string { return JSON.stringify(citadel.geoip) }
+    // explain the first waiting alert (or a live connection by key); poll with explanation()
+    function explain(key: string, fresh: bool): string {
+      var c = _connByKey(key)
+      if (!c) return "no such connection"
+      citadel.explain(c, fresh)
+      return citadel.explainKey(c)
+    }
+    function explanation(key: string): string { return JSON.stringify(citadel.explanationOf(_connByKey(key))) }
+    function explainTest(): void { citadel.testExplain() }
+    function explainInfo(): string {
+      return JSON.stringify({ agent: citadel.explainAgent, defaultAgent: citadel.defaultAgent,
+                              available: citadel.explainAvailable, test: citadel.explainTestResult })
+    }
+    function _connByKey(key: string): var {
+      if (!key && citadel.alerts.length) return citadel.alerts[0].conn
+      var a = citadel.alerts.filter(function(x) { return x.key === key })[0]
+      return a ? a.conn : citadel.conns.filter(function(c) { return c.key === key })[0] || null
+    }
     function status(): string {
       return JSON.stringify({ mode: citadel.mode, zone: citadel.activeProfile, enforce: citadel.enforce,
                               enforceActive: citadel.enforceActive, waiting: citadel.alerts.length,
@@ -318,7 +363,7 @@ Panel {
               }
             }
           }
-          TrafficView { visible: root.view === "traffic"; width: parent.width; p: root; s: citadel }
+          TrafficView { id: trafficView; visible: root.view === "traffic"; width: parent.width; p: root; s: citadel }
           PoliciesView { id: policiesView; visible: root.view === "policies"; width: parent.width; p: root; s: citadel }
           HistoryView { visible: root.view === "history"; width: parent.width; p: root; s: citadel }
           SettingsView { visible: root.view === "settings"; width: parent.width; p: root; s: citadel }

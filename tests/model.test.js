@@ -119,11 +119,89 @@ eq("gate: 1.2.1 ok", M.helperGate(true, "1.2.1", "1.1.1").usable, true)
 eq("gate: unreleased 1.2.0 refused", M.helperGate(true, "1.2.0", "1.1.1").usable, false)
 eq("gate: 1.10.0 ok", M.helperGate(true, "1.10.0", "1.1.1").usable, true)
 
+// whole-app policy on one port matches only that port (was: every port)
+const onPort = M.buildSpec([M.makeRule({ app: CH, port: 443, action: "deny" })], ctx(), [], apps, [], 1000)
+eq("whole app + port keeps the port", onPort.spec.rules.filter(e => e.cgroup)[0].targets,
+   [{ ip: "0.0.0.0/0", port: 443 }, { ip: "::/0", port: 443 }])
+
+// proxy routes on policies
+const PX = [{ id: "p1", name: "Office", type: "http", host: "172.16.1.3", port: 8080, listen: 47001 },
+            { id: "p2", name: "Home", type: "socks5", host: "proxy.example", port: 1080, listen: 47002 }]
+const allowViaP1 = M.makeRule({ id: "a1", app: CH, action: "allow", route: "p1" })
+eq("routes default to 'default'", M.makeRule({ app: CH, action: "allow" }).route, "default")
+eq("old policies load with the default route", M.makeRule({ id: "old", app: CH, action: "allow", createdAt: 1 }).route, "default")
+let rt = M.compileRoutes([allowViaP1], "direct", PX, ctx({ resolved: { "proxy.example": ["203.0.113.7"] } }), [], apps, 1000)
+eq("allow via proxy redirects the app to its listener", rt.rules, [{ verdict: "redirect", port: 47001, cgroup: CGC }])
+eq("default direct: no catch-all", rt.defaultPort, null)
+eq("proxy servers are excluded (literal and resolved)", rt.exclude, ["172.16.1.3", "203.0.113.7"])
+eq("nothing routed: no proxy section", M.compileRoutes([M.makeRule({ app: CH, action: "allow" })], "direct", PX, ctx(), [], apps, 1000), null)
+rt = M.compileRoutes([M.makeRule({ app: CH, action: "allow" })], "p2", PX, ctx(), [], apps, 1000)
+eq("default route via proxy: catch-all", rt.defaultPort, 47002)
+eq("a plain Allow leaves routing to the catch-all", rt.rules, [])
+rt = M.compileRoutes([allowViaP1, M.makeRule({ app: CH, host: "www.google.com", action: "allow", route: "direct" })],
+                     "direct", PX, ctx(), [conn()], apps, 1000)
+eq("more specific direct route comes first", rt.rules.map(e => e.verdict), ["direct", "redirect"])
+rt = M.compileRoutes([allowViaP1, M.makeRule({ app: CH, host: "www.google.com", action: "deny" })], "direct", PX, ctx(), [conn()], apps, 1000)
+eq("block policies are never routed", rt.rules.map(e => e.verdict), ["redirect"])
+rt = M.compileRoutes([M.makeRule({ app: CH, action: "allow", route: "gone" })], "direct", PX, ctx(), [], apps, 1000)
+eq("route to a deleted proxy fails closed", rt.rules[0].port, 47000)
+eq("routeFor: via proxy", M.routeFor(conn(), [allowViaP1], ctx(), "direct", PX).name, "Office")
+eq("routeFor: direct", M.routeFor(conn(), [M.makeRule({ app: CH, action: "allow", route: "direct" })], ctx(), "p1", PX), null)
+eq("routeFor: no policy uses default", M.routeFor(conn(), [], ctx(), "p2", PX).name, "Home")
+eq("routeFor: blocked has no route", M.routeFor(conn(), [M.makeRule({ app: CH, action: "deny" })], ctx(), "p1", PX), null)
+// a narrower plain Allow (e.g. from the gate) must not pull a destination out of the app's proxy route
+const narrowAllow = M.makeRule({ app: CH, host: "www.google.com", action: "allow" })
+rt = M.compileRoutes([allowViaP1, narrowAllow], "direct", PX, ctx(), [conn()], apps, 1000)
+eq("plain Allow for a host doesn't override the app's proxy route", rt.rules, [{ verdict: "redirect", port: 47001, cgroup: CGC }])
+eq("routeFor: narrower plain Allow keeps the app's proxy", M.routeFor(conn(), [allowViaP1, narrowAllow], ctx(), "direct", PX).name, "Office")
+eq("routeFor: narrower explicit direct wins", M.routeFor(conn(), [allowViaP1, M.makeRule({ app: CH, host: "www.google.com", action: "allow", route: "direct" })], ctx(), "direct", PX), null)
+eq("routeFor: a Block still wins over the route", M.routeFor(conn(), [allowViaP1, M.makeRule({ app: CH, host: "www.google.com", action: "deny" })], ctx(), "direct", PX), null)
+// cutting connections whose route changed
+{
+  const live = [Object.assign(conn(), { proto: "tcp", raddr: "142.250.1.1", rport: 443 }),
+                Object.assign(conn(), { key: "k2", proto: "tcp", raddr: "172.16.1.3", rport: 8080 }),
+                Object.assign(conn(), { key: "k3", proto: "udp", raddr: "8.8.8.8", rport: 53 })]
+  const routes = M.compileRoutes([allowViaP1], "direct", PX, ctx(), live, apps, 1000)
+  eq("route cut: newly routed app's connections are cut, not the proxy's or UDP",
+     M.routeCutTargets(null, routes, live, 1000), [{ cgroup: CGC, ip: "142.250.1.1" }])
+  eq("route cut: nothing changed, nothing cut", M.routeCutTargets(routes, routes, live, 1000), [])
+  eq("route cut: route removed moves traffic back", M.routeCutTargets(routes, null, live, 1000), [{ cgroup: CGC, ip: "142.250.1.1" }])
+  const narrow = { rules: [{ verdict: "redirect", port: 47001, cgroup: CGC, targets: [{ ip: "10.0.0.0/8", port: null }] }], exclude: [] }
+  eq("route cut: per-destination entry cuts only those destinations", M.routeCutTargets(null, narrow, live, 1000), [])
+}
+eq("gate: always allow via proxy", M.ruleFromAlert({ conn: conn() }, "allow", "host", "forever", "*", null, false, "p1").route, "p1")
+eq("gate: block ignores route", M.ruleFromAlert({ conn: conn() }, "deny", "host", "forever", "*", null, false, "p1").route, "default")
+eq("free listener port", M.freeListenPort(PX), 47003)
+
 // profiles
 const profiles = [{ name: "Home", networks: ["US"] }, { name: "Public", networks: ["Cafe WiFi"] }]
 eq("profile by ssid", M.activeProfile(profiles, "", ["Cafe WiFi"]), "Public")
 eq("profile default", M.activeProfile(profiles, "", ["Unknown"]), "Home")
 eq("profile override", M.activeProfile(profiles, "Public", ["US"]), "Public")
+
+// where a policy came from, and the Policies list filter
+eq("origin: gate verdict", M.ruleFromAlert({ conn: conn() }, "allow", "host", "forever", "*", null, false).origin, "gate")
+eq("origin: form / Traffic default to you", M.makeRule({ app: CH, action: "deny" }).origin, "you")
+eq("origin: old gate policy (has exeHash)", M.makeRule({ app: CH, exeHash: "ab12", createdAt: 1 }).origin, "gate")
+eq("origin: kept when given", M.makeRule({ app: CH, origin: "gate" }).origin, "gate")
+{
+  const R = [M.makeRule({ id: "g1", app: CH, host: "ads.example", action: "deny", exeHash: "x", createdAt: 100 }),
+             M.makeRule({ id: "y1", app: "/usr/bin/remmina", host: "172.16.1.222", action: "allow", createdAt: 300 }),
+             M.makeRule({ id: "y2", app: "/opt/microsoft/msedge/msedge", action: "allow", route: "p1", createdAt: 200 }),
+             M.makeRule({ id: "z1", host: "work.example", action: "allow", profile: "Work", createdAt: 400 })]
+  const ids = (o) => M.filterRules(R, o, id => id === "p1" ? "Office" : "?").map(r => r.id)
+  eq("filter: newest first by default", ids({}), ["z1", "y1", "y2", "g1"])
+  eq("filter: added by you", ids({ show: "you" }), ["z1", "y1", "y2"])
+  eq("filter: from the gate", ids({ show: "gate" }), ["g1"])
+  eq("filter: blocks", ids({ show: "deny" }), ["g1"])
+  eq("filter: via proxy", ids({ show: "proxy" }), ["y2"])
+  eq("search: app basename", ids({ query: "remmina" }), ["y1"])
+  eq("search: host part", ids({ query: "168.1" }), ["y1"])
+  eq("search: proxy name", ids({ query: "office" }), ["y2"])
+  eq("search: every word must match", ids({ query: "msedge office" }), ["y2"])
+  eq("filter: zone keeps all-zone policies", ids({ profile: "Home" }), ["y1", "y2", "g1"])
+  eq("sort: precedence puts app+host policies first", ids({ sort: "precedence" }).slice(0, 2).sort(), ["g1", "y1"])
+}
 
 console.log(`${n - fails}/${n} passed`)
 process.exit(fails ? 1 : 0)

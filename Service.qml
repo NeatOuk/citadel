@@ -23,6 +23,7 @@ Item {
   readonly property string specPath: stateDir + "/enforce/spec.json"
   readonly property string killPath: stateDir + "/enforce/kill.json"
   readonly property string monitorBin: pluginDir + "/bin/citadel-monitor"
+  readonly property string explainBin: pluginDir + "/bin/citadel-explain"
   readonly property string helperBin: "/usr/lib/citadel/citadel-enforcer"
   property int uid: -1                      // reported by the monitor
 
@@ -36,7 +37,8 @@ Item {
   property var lists: []
   property var decisionLog: []
   property var prefs: ({ interval: 2, alertTimeout: 90, alertDefault: "allow",
-                         retentionDays: 30, notify: true, modeMinutes: 0, catchShort: true })
+                         retentionDays: 30, notify: true, modeMinutes: 0, catchShort: true,
+                         explainCommand: "", explainModel: "" })
   property bool loaded: false
 
   readonly property var defaultLists: [
@@ -97,6 +99,20 @@ Item {
   // citadel-helper 1.1.1 fixed kill requests that could close other users'
   // sockets; older helpers report no version at all
   readonly property string minHelper: "1.1.1"
+  readonly property string minProxyHelper: "1.3.0"      // proxy routing (nat redirect)
+  readonly property bool proxyCapable: helperUsable && !Model.versionLess(helperVersion, minProxyHelper)
+
+  // ------------------------------------------------- proxies (persisted)
+  // [{id, name, type: http|https|socks5, host, port, listen, auth, verifyTls}]
+  property var proxies: []
+  property string defaultRoute: "direct"      // "direct" or a proxy id
+  // live, from citadel-proxy: id -> {ok, ms, error, ts}; recent failures
+  property var proxyStatus: ({})
+  property var proxyLog: []
+  property var proxyCarried: []              // [{ts, counts: {id: n}}], last 5 min of stats events
+  property var _proxyFailed: ({})             // "ip|port" -> ts of the last proxy failure
+  property var proxyCheck: ({})               // id -> result of the last Check
+  property string proxyError: ""              // e.g. helper too old for routing
   readonly property var helperGate: Model.helperGate(helperInstalled, helperVersion, minHelper)
   // the only condition under which apply / kill may be sent to the helper
   readonly property bool helperUsable: helperGate.usable
@@ -106,6 +122,8 @@ Item {
     : (Model.versionLess(helperVersion, minHelper) ? "is older than " + minHelper : "is an unreleased build")
       + " and has a security bug"
   property string _lastSpec: ""
+  property var _appliedRoutes: null         // proxy section of the last applied spec
+  property var _pendingRoutes: null         // ... of the spec being applied
 
   // ------------------------------------------------- persistence
   FileView {
@@ -134,6 +152,8 @@ Item {
       decisionLog = s.decisionLog || []
       var p = s.prefs || {}
       prefs = Object.assign({}, prefs, p)
+      proxies = (s.proxies || []).filter(function(x) { return x && x.id && x.listen })
+      defaultRoute = s.defaultRoute || "direct"
     }
     // merge built-in list catalogue with saved subscriptions
     var saved = {}
@@ -144,6 +164,7 @@ Item {
     loaded = true
     save()
     _sendConfig()
+    _configureProxy()
     if (enforce) _syncEnforcement(true)
   }
 
@@ -155,7 +176,8 @@ Item {
     return JSON.stringify({
       version: 2, rules: root.rules, profiles: root.profiles, profileOverride: root.profileOverride,
       mode: root.mode, silentUntil: root.silentUntil, enforce: root.enforce, lists: root.lists,
-      decisionLog: root.decisionLog.slice(0, 300), prefs: root.prefs
+      decisionLog: root.decisionLog.slice(0, 300), prefs: root.prefs,
+      proxies: root.proxies, defaultRoute: root.defaultRoute
     }, null, 2) + "\n"
   }
   Timer {
@@ -190,6 +212,7 @@ Item {
     if (!loaded) return
     var hosts = {}
     rules.forEach(function(r) { if (r.host !== "*" && !Model.isAddressLike(r.host)) hosts[r.host] = true })
+    proxies.forEach(function(x) { if (!Model.isAddressLike(x.host)) hosts[Model.normHost(x.host)] = true })
     _send({ cmd: "config", interval: Number(prefs.interval) || 2, retentionDays: Number(prefs.retentionDays) || 30,
             resolveHosts: Object.keys(hosts), lists: lists })
   }
@@ -266,6 +289,9 @@ Item {
         var sd = Model.decide(sc, rules, ctx)
         recent.push({ conn: sc, decision: sd })
         if (first) continue
+        // a routed connection the proxy just reset: already blocked and logged,
+        // and too short for the app to be named reliably
+        if (_proxyFailed[sc.raddr + "|" + sc.rport] > now - 10) continue
         var trusted = sc.confidence === "matched" || sc.confidence === "likely"
         if (sd.verdict === "prompt" && trusted) _queueAlert(newAlerts, sc, sd)
         else if (sd.source === "silent" || sd.source === "blocklist")
@@ -308,7 +334,7 @@ Item {
   // Answer the oldest (or given) alert.
   // action: allow|deny ; scope: hostPort|host|app ; duration: once|untilQuit|forever
   // viaScoped: the policy only covers the app when started by the same launcher
-  function answer(key, action, scope, duration, source, viaScoped) {
+  function answer(key, action, scope, duration, source, viaScoped, route) {
     var alert = null
     for (var i = 0; i < alerts.length; i++) if (alerts[i].key === key) { alert = alerts[i]; break }
     if (!alert) return
@@ -320,7 +346,7 @@ Item {
       var info = apps[alert.conn.exe] || null
       // replace a stale rule for a changed binary
       if (alert.changed) rules = rules.filter(function(r) { return !(r.app === alert.conn.exe && r.exeHash) })
-      addRule(Model.ruleFromAlert(alert, action, scope, duration, "*", info, viaScoped === true), true)
+      addRule(Model.ruleFromAlert(alert, action, scope, duration, "*", info, viaScoped === true, route), true)
     }
     if (action === "deny") {
       var exe = alert.conn.exe, dest = alert.conn.raddr, port = alert.conn.rport, viaId = alert.conn.viaId || ""
@@ -571,6 +597,20 @@ Item {
   }
   // pick the helper up as soon as the package is installed
   Timer { interval: 10000; repeat: true; running: !root.helperInstalled; onTriggered: helperCheck.running = true }
+  // any upgrade (not only from an outdated helper) changes the file: re-check
+  // the version then. `stat` needs no privileges, unlike `status`.
+  property string _helperStamp: ""
+  Process {
+    id: helperStat
+    command: ["stat", "-c", "%Y %s", root.helperBin]
+    stdout: StdioCollector { id: helperStatOut; waitForEnd: true }
+    onExited: function(code) {
+      var st = code === 0 ? helperStatOut.text.trim() : ""
+      if (root._helperStamp !== "" && st !== "" && st !== root._helperStamp) root.verifyHelper()
+      root._helperStamp = st
+    }
+  }
+  Timer { interval: 15000; repeat: true; running: root.helperInstalled; triggeredOnStart: true; onTriggered: helperStat.running = true }
   // an outdated helper may be upgraded at any time: re-check its version
   Timer { interval: 60000; repeat: true; running: root.helperInstalled && root.helperOutdated; onTriggered: root.verifyHelper() }
 
@@ -643,6 +683,11 @@ Item {
         root.enforceActive = true
         root.enforceError = ""
         root.enforceAppliedAt = Date.now() / 1000
+        // connections opened before a route changed keep their old path:
+        // cut them so the apps reconnect through (or around) the proxy
+        var cut = Model.routeCutTargets(root._appliedRoutes, root._pendingRoutes, root.conns, root.uid)
+        root._appliedRoutes = root._pendingRoutes
+        if (cut.length) root._kill(cut)
         // (apply only runs once the helper version was verified)
       } else {
         root.enforceActive = false
@@ -676,8 +721,25 @@ Item {
   }
   function _doSync() {
     if (!enforce || !helperUsable || uid < 0) return
-    var res = Model.buildSpec(rules, _ctx(), conns, apps, ipCidrs, uid)
+    var ctx = _ctx()
+    var res = Model.buildSpec(rules, ctx, conns, apps, ipCidrs, uid)
     res.spec.logNew = prefs.catchShort !== false        // ignored by helpers older than 1.2
+    var routes = Model.compileRoutes(rules, defaultRoute, proxies, ctx, conns, apps, uid)
+    if (routes && proxyCapable) {
+      res.spec.proxy = routes
+      proxyError = ""
+    } else if (routes) {
+      // An older helper would ignore the routes and the apps would go direct:
+      // block what should be proxied until the helper is updated.
+      var blocks = routes.rules.filter(function(e) { return e.verdict === "redirect" })
+        .map(function(e) { var d = Object.assign({}, e, { verdict: "drop" }); delete d.port; return d })
+      res.spec.rules = blocks.concat(res.spec.rules)
+      if (routes.defaultPort !== null) res.spec.silentDeny = true
+      proxyError = "Proxy routing needs citadel-helper " + minProxyHelper + " or newer (installed: "
+                   + (helperVersion || "unknown") + "). Apps routed through a proxy are blocked until it is updated."
+    } else {
+      proxyError = ""
+    }
     approx = res.approx
     var text = JSON.stringify(res.spec)
     if (text === _lastSpec && !_forceSync) return
@@ -685,6 +747,7 @@ Item {
     _lastSpec = text
     _lastSyncAt = Date.now()
     enforceBusy = true
+    _pendingRoutes = res.spec.proxy || null
     specFile.setText(text + "\n")
   }
   function _kill(targets) {
@@ -750,6 +813,199 @@ Item {
     command: ["id", "-Gn"]
     stdout: StdioCollector { id: groupsOut; waitForEnd: true }
     onExited: root.inWheel = String(groupsOut.text || "").split(/\s+/).indexOf("wheel") !== -1
+  }
+
+  // ------------------------------------------------- citadel-proxy (user process)
+  readonly property string proxyBin: pluginDir + "/bin/citadel-proxy"
+  Process {
+    id: proxyProc
+    command: [root.proxyBin]
+    stdinEnabled: true
+    stdout: SplitParser { onRead: function(line) { root._onProxyLine(line) } }
+    onStarted: root._configureProxy()
+    onExited: if (root.proxies.length) restartProxy.restart()
+  }
+  Timer { id: restartProxy; interval: 3000; onTriggered: if (root.proxies.length) proxyProc.running = true }
+
+  function _configureProxy() {
+    if (!loaded) return
+    if (!proxies.length) { if (proxyProc.running) proxyProc.running = false; return }
+    if (!proxyProc.running) { proxyProc.running = true; return }     // configured in onStarted
+    proxyProc.write(JSON.stringify({ cmd: "config", checkEvery: 30, proxies: proxies }) + "\n")
+  }
+  function _onProxyLine(line) {
+    var m
+    try { m = JSON.parse(line) } catch (e) { return }
+    if (m.type === "status") {
+      var st = Object.assign({}, proxyStatus)
+      st[m.id] = { ok: !!m.ok, ms: m.ms || 0, error: m.error || "", ts: Date.now() / 1000 }
+      proxyStatus = st
+    } else if (m.type === "check") {
+      var ck = Object.assign({}, proxyCheck)
+      ck[m.id] = { ok: !!m.ok, ms: m.ms || 0, error: m.error || "", ts: Date.now() / 1000 }
+      proxyCheck = ck
+    } else if (m.type === "error") {
+      var pf = {}
+      for (var fk in _proxyFailed) if (_proxyFailed[fk] > now - 60) pf[fk] = _proxyFailed[fk]
+      pf[m.dst + "|" + m.port] = now
+      _proxyFailed = pf
+      var px = proxies.filter(function(x) { return x.id === m.id })[0]
+      var name = px ? px.name : m.id
+      var entry = { ts: Date.now() / 1000, proxy: name, dst: m.dst, port: m.port, error: m.error }
+      // merge repeats of the same proxy + destination within a minute
+      var last = proxyLog[0]
+      if (last && last.proxy === name && last.dst === m.dst && entry.ts - last.ts < 60) return
+      proxyLog = [entry].concat(proxyLog).slice(0, 50)
+      _log([{ ts: now, app: "via " + name, exe: "", via: "", dest: m.dst, ip: m.dst, port: m.port, cc: "",
+              verdict: "deny", source: "proxy " + name + " unreachable" }])
+    } else if (m.type === "stats") {
+      proxyCarried = proxyCarried.filter(function(x) { return x.ts > now - 300 }).concat([{ ts: now, counts: m.counts || {} }])
+    } else if (m.type === "log") console.warn("[citadel] proxy:", m.msg)
+  }
+
+  // secret-tool keeps "user:password" in the desktop keyring
+  Process { id: secretStore; stdinEnabled: true; property string secret: ""
+    onStarted: { write(secret); secret = ""; stdinEnabled = false }
+    onExited: { stdinEnabled = true; root._configureProxy() } }
+  function _storeSecret(id, name, user, password) {
+    secretStore.secret = user + ":" + password
+    secretStore.command = ["secret-tool", "store", "--label=Citadel proxy " + name, "citadel-proxy", id]
+    secretStore.running = true
+  }
+
+  // fields: {id?, name, type, host, port, verifyTls}; user/password optional
+  // ("" keeps the stored login when editing, null removes it)
+  function saveProxy(fields, user, password) {
+    var type = ["http", "https", "socks5"].indexOf(fields.type) !== -1 ? fields.type : "http"
+    var port = Math.round(Number(fields.port))
+    var host = String(fields.host || "").trim()
+    if (!host || !(port >= 1 && port <= 65535)) return "Enter a host and a port (1–65535)."
+    var old = proxies.filter(function(x) { return x.id === fields.id })[0]
+    var id = old ? old.id : "px" + Date.now().toString(36)
+    var auth = user === null ? false : (user ? true : !!(old && old.auth))
+    var px = { id: id, name: String(fields.name || host).trim(), type: type, host: host, port: port,
+               listen: old ? old.listen : Model.freeListenPort(proxies), auth: auth,
+               verifyTls: fields.verifyTls !== false }
+    if (!px.listen) return "Too many proxies."
+    proxies = old ? proxies.map(function(x) { return x.id === id ? px : x }) : proxies.concat([px])
+    save()
+    _sendConfig()
+    if (user) _storeSecret(id, px.name, user, password || "")
+    else if (user === null) Quickshell.execDetached(["secret-tool", "clear", "citadel-proxy", id])
+    _configureProxy()
+    if (enforce) _syncEnforcement(true)
+    return ""
+  }
+  function removeProxy(id) {
+    proxies = proxies.filter(function(x) { return x.id !== id })
+    var st = Object.assign({}, proxyStatus); delete st[id]; proxyStatus = st
+    var ck = Object.assign({}, proxyCheck); delete ck[id]; proxyCheck = ck
+    if (defaultRoute === id) defaultRoute = "direct"
+    Quickshell.execDetached(["secret-tool", "clear", "citadel-proxy", id])
+    save(); _configureProxy()
+    if (enforce) _syncEnforcement(true)
+  }
+  function checkProxy(id) {
+    var ck = Object.assign({}, proxyCheck); ck[id] = { pending: true }; proxyCheck = ck
+    if (proxyProc.running) proxyProc.write(JSON.stringify({ cmd: "check", id: id }) + "\n")
+  }
+  function setDefaultRoute(route) {
+    defaultRoute = route === "direct" || proxies.some(function(x) { return x.id === route }) ? route : "direct"
+    save()
+    if (enforce) _syncEnforcement(true)
+  }
+  function proxyName(route) {
+    if (!route || route === "direct") return ""
+    var px = proxies.filter(function(x) { return x.id === route })[0]
+    return px ? px.name : "missing proxy"
+  }
+  function proxyCarried5m(id) {
+    var n = 0
+    proxyCarried.forEach(function(x) { if (x.ts > now - 300) n += Number(x.counts[id] || 0) })
+    return n
+  }
+  function routeOf(conn) { return Model.routeFor(conn, rules, _ctx(), defaultRoute, proxies) }
+
+  // ------------------------------------------------- explain (the user's own agent)
+  // Who answers: the custom command from Settings, else the user's Omarchy
+  // default agent. Nothing runs until Explain is pressed.
+  FileView {
+    id: agentFile
+    path: root.home + "/.config/omarchy/defaults/agent"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+  }
+  readonly property string defaultAgent: String(agentFile.text() || "").trim()
+  readonly property bool explainCustom: String(prefs.explainCommand || "").trim() !== ""
+  readonly property string explainAgent: explainCustom ? "custom command" : defaultAgent
+  readonly property bool explainAvailable: explainAgent !== ""
+  property var explanations: ({})           // explainKey -> {state, result, agent, model, cached, error}
+  property var _explainQueue: []            // [{key, req}]
+  property var explainTestResult: ({})
+
+  function explainKey(conn) {
+    return (conn.exe || conn.app || "?") + "|" + (conn.host || conn.raddr || "") + "|" + (conn.rport || "")
+  }
+  function explanationOf(conn) { return conn ? explanations[explainKey(conn)] || null : null }
+  function _setExplanation(key, value) {
+    var e = Object.assign({}, explanations); e[key] = value; explanations = e
+    // the user is reading about it: restart that request's countdown
+    alerts = alerts.map(function(a) {
+      return root.explainKey(a.conn) === key ? Object.assign({}, a, { firstSeen: root.now }) : a
+    })
+  }
+  function explain(conn, fresh) {
+    if (!conn || !explainAvailable) return
+    var key = explainKey(conn)
+    var cur = explanations[key]
+    if (cur && cur.state === "pending") return
+    _setExplanation(key, { state: "pending", agent: explainAgent })
+    // the command line is masked by the monitor; only what's needed leaves the machine
+    var c = { app: conn.app || "", exe: conn.exe || "", via: conn.via || "", cmd: conn.cmd || "",
+              host: conn.host || "", raddr: conn.raddr || "", rport: conn.rport || 0, proto: conn.proto || "tcp",
+              cc: conn.cc || "", org: conn.org || "" }
+    _explainQueue = _explainQueue.concat([{ key: key, req: { conn: c, fresh: !!fresh } }])
+    _explainNext()
+  }
+  function testExplain() {
+    explainTestResult = { state: "pending", agent: explainAgent }
+    _explainQueue = _explainQueue.concat([{ key: "", test: true, req: { test: true } }])
+    _explainNext()
+  }
+  function _explainNext() {
+    if (explainProc.running || _explainQueue.length === 0) return
+    var job = _explainQueue[0]
+    _explainQueue = _explainQueue.slice(1)
+    job.req.prefs = { explainCommand: prefs.explainCommand || "", explainModel: prefs.explainModel || "" }
+    explainProc.job = job
+    explainProc.input = JSON.stringify(job.req)
+    explainProc.command = ["python3", root.explainBin]
+    explainProc.running = true
+  }
+  function _explainDone(job, text) {
+    var r = null
+    var lines = String(text || "").trim().split("\n")
+    try { r = JSON.parse(lines[lines.length - 1]) } catch (e) { r = null }
+    var v = !r ? { state: "error", code: "failed", error: "Citadel explain gave no answer.", agent: explainAgent }
+          : r.ok ? { state: "done", result: r.result, agent: r.agent, model: r.model || "", cached: !!r.cached }
+          : { state: "error", code: r.code || "failed", error: r.error || "failed", agent: r.agent || explainAgent }
+    if (job.test) explainTestResult = v
+    else _setExplanation(job.key, v)
+  }
+  Process {
+    id: explainProc
+    property var job: null
+    property string input: ""
+    stdinEnabled: true
+    stdout: StdioCollector { id: explainOut; waitForEnd: true }
+    onStarted: { write(input); input = ""; stdinEnabled = false }
+    onExited: {
+      stdinEnabled = true
+      var j = job; job = null
+      if (j) root._explainDone(j, explainOut.text)
+      root._explainNext()
+    }
   }
 
   Component.onCompleted: {
