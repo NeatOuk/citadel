@@ -1,8 +1,30 @@
 # Citadel
 
-Citadel is an outbound firewall for the Omarchy bar. Your apps sit inside the
-walls. Whenever one tries to reach somewhere new, it waits **at the gate** for your verdict.
-Everything you decide becomes a **policy** that Citadel enforces with nftables.
+**Your local firewall, taken to the next level.**
+
+A normal firewall guards the door: it decides which ports are open to the
+outside. Citadel guards the way out. It knows **which app** is making each
+connection, asks you the first time it tries to reach somewhere new, and
+remembers your answer.
+
+Citadel lives in the Omarchy bar as a small tower. Your apps sit inside the
+walls. When one tries to reach somewhere new, it waits **at the gate** for your
+verdict: **Block**, **Allow once** or **Always allow**. Everything you decide
+becomes a **policy** that Citadel enforces with nftables, per app.
+
+| A typical firewall | Citadel |
+|---|---|
+| Rules by port and address | Rules by **app**, host, IP range, port, or any mix |
+| Set up once, then silent | **Asks** when an app does something new |
+| Can't tell apps apart | Shows the app, its **integrity** (checked against pacman's checksums), and where it's going: host, country, port |
+| One rule set everywhere | **Zones**: different policies at home, at work, on café Wi-Fi |
+| No record of what happened | Live **traffic** per app, plus **history** of top apps, hosts and countries |
+| Manual block lists | One-click **threat feeds**: FireHOL, Spamhaus DROP, StevenBlack, HaGeZi |
+
+Three **modes** cover the rest. **Guarded** asks, **Open** lets everything
+through and logs it, and **Lockdown** blocks anything not allowed.
+
+No account, no telemetry. Everything stays on your machine.
 
 <p align="center">
   <img src="docs/screenshots/gate-card.png" width="440" alt="A connection waiting at the gate: python3.14 wants to reach 208.67.222.222 on port 443, with Block, Allow once and Always allow buttons">
@@ -14,15 +36,22 @@ Everything you decide becomes a **policy** that Citadel enforces with nftables.
 
 Citadel watches and asks without any extra software. To actually **block**
 traffic it needs **[citadel-helper](https://github.com/NeatOuk/citadel-helper)**,
-a small root helper that turns your policies into nftables rules. **Citadel needs
-citadel-helper 1.1.1 or newer** ([tag `v1.1.1`](https://github.com/NeatOuk/citadel-helper/releases/tag/v1.1.1)),
-which only ever closes your own connections. Settings warns if an older helper
-is installed. Build and install it once:
+a small root helper that turns your policies into nftables rules. This release
+is built and tested with **citadel-helper 1.3.2** ([tag `v1.3.2`](https://github.com/NeatOuk/citadel-helper/releases/tag/v1.3.2)).
+Build and install it once:
 
 ```bash
-git clone https://github.com/NeatOuk/citadel-helper.git
+git clone --branch v1.3.2 https://github.com/NeatOuk/citadel-helper.git
 cd citadel-helper && makepkg -si
 ```
+
+| Helper version | What works |
+|---|---|
+| older than 1.1.1, or the unreleased 1.2.0 build | nothing privileged: both have a security bug, so Citadel never sends them rules or kill requests, and Settings asks you to update |
+| 1.1.1 | blocking |
+| 1.2.1 | + catching very short connections |
+| 1.3.0 | + per-app proxy routing |
+| 1.3.2 | + real host names (lets Citadel read the names apps look up from systemd-resolved) |
 
 An AUR package is coming later.
 
@@ -57,8 +86,11 @@ Citadel never edits your own configuration files. It only writes to `~/.local/sh
 | Integrity check | `pacman` | Arch-based systems |
 | Notifications, clipboard import/export | `libnotify`, `wl-clipboard` | part of Omarchy |
 | Zone switching | `networkmanager` **or** `iwd` | wired links are detected either way; with neither, pick zones by hand |
-| Countries | `python-maxminddb` | optional; the database downloads from Settings |
+| Countries and network owners | `python-maxminddb` | optional; the databases download from Settings |
+| Proxy logins | `libsecret` (`secret-tool`) and a keyring such as gnome-keyring | only for proxies that need a username and password |
+| Explain | an Omarchy default agent (`omarchy agent --pick`) or any command-line AI tool | optional; see [Explain](#explain) |
 | Enforcement | [`citadel-helper`](https://github.com/NeatOuk/citadel-helper) (built with `makepkg`) → `nftables`, `polkit` | kernel with `nft_socket`, cgroup v2 and `INET_DIAG_DESTROY` (stock Arch has all three) |
+| Host names | `systemd-resolved` (Omarchy's default) and citadel-helper 1.3.2 | otherwise reverse DNS only |
 | Password-free enforcement | membership in `wheel` | otherwise polkit asks for an admin password each time |
 
 ## At a glance
@@ -105,13 +137,130 @@ Citadel never edits your own configuration files. It only writes to `~/.local/sh
 | Tab | What's there |
 |---|---|
 | **Gate** | Every connection waiting for a verdict. |
-| **Traffic** | Live connections grouped by app: host, country, ports, bytes and rate in both directions, and why each one is allowed or blocked. Allow or Block an app, or a single destination. |
-| **Policies** | Your policies. Each can cover an app, a host (domains include subdomains), an IP or CIDR, a port, or a combination. Scope them to a zone or to all zones. The most specific policy wins, and Block wins ties. Edit or remove them, or export and import through the clipboard. |
+| **Traffic** | Live connections grouped by app: host, country, ports, bytes and rate in both directions, and why each one is allowed or blocked. Allow or Block an app, or a single destination. With proxies set up, a **Proxy** tab shows each proxy's health, what it carries now and in the last 5 minutes, the policies routing through it, and recent failures. |
+| **Policies** | Your policies. Each can cover an app, a host (domains include subdomains), an IP or CIDR, a port, or a combination. Scope them to a zone or to all zones. The most specific policy wins, and Block wins ties. An Allow policy can also set a **Route** (direct or via a proxy, see [Proxy routing](#proxy-routing)). Search by app, host, IP or proxy; show only the ones **added by you**, **from the gate**, blocks or proxy routes; sort newest first or by precedence. Edit or remove them, or export and import through the clipboard. |
 | | **Threat feeds:** IP feeds (FireHOL, Spamhaus DROP) go straight into the firewall. Domain feeds (StevenBlack, HaGeZi) block matching host names. LAN, loopback, Tailscale/CGNAT and multicast ranges are always removed from IP feeds. Feeds refresh daily. |
 | **History** | Traffic over the last hour, top apps and hosts (today or 7 days), countries, and the log of verdicts. |
-| **Settings** | Enforcement, the timer for Open and Lockdown, **zones** (link Wi-Fi or wired networks and Citadel switches as you move), what happens to an unanswered request, notifications, refresh rate, history retention, and the country database. |
+| **Settings** | Enforcement, **proxies** and where everything else goes, the timer for Open and Lockdown, **zones** (link Wi-Fi or wired networks and Citadel switches as you move), what happens to an unanswered request, notifications, refresh rate, history retention, the country and network-owner databases, and **Explain**. |
+
+**Who started it.** Tools like `curl`, `wget` or `git` are started by
+something else, so Citadel shows the **launcher** too:
+- `curl via omarchy-network-speedtest` for a script, or `claude in ghostty` when you started it in a terminal
+- the command line, with passwords, tokens, `Authorization` headers and request bodies masked
+- the full launch chain, under **Adjust**
+
+At the gate, a verdict can cover the app **only when started by that
+launcher**, so allowing curl for your speed test doesn't allow curl for everything.
+
+**Short connections.** Many tool connections last less than a second, too short
+to catch between two checks. With enforcement on and citadel-helper 1.2 or
+newer, the helper logs each new connection from your apps to the kernel log
+(rate-limited). Citadel reads it live and matches the connection to the process
+that made it. Traffic shows these under **Just now**, each with a label saying
+how sure the match is:
+- **matched:** the command, or its launcher script, names that host
+- **likely:** matched by timing
+- **app unclear**
+
+Only matched or likely connections are sent to the gate. The log lines are also
+kept in your system journal like any kernel message. Turn this off under
+**Settings → Catch short connections**.
 
 **Integrity** stands in for code signing. Each program is checked against the sha256 that pacman recorded for its package. The levels are **verified**, **modified**, **not packaged** and **suspicious** (runs from `/tmp`, or deleted). If a program you allowed changes without a package update, it comes back to the gate.
+
+## Proxy routing
+
+Like Proxifier, Citadel can send chosen apps through a proxy while everything
+else goes direct. For example, a mail app goes via `172.16.1.3:8080` while the browser goes direct.
+
+1. **Settings → Proxies**: add a proxy (**HTTP**, **HTTPS** or **SOCKS5**, with an optional username and password). **Check** tests it end to end.
+2. Give an **Allow** policy a **Route**: *Default*, *Direct* or *via &lt;proxy&gt;*. At the gate, **Adjust → Always allow routes it** does the same.
+3. **Everything else** in Settings sets the route for traffic no policy covers.
+
+Block stays Block. Routing is part of allowing, and the most specific policy
+decides both. Traffic shows `via <proxy>` on routed connections.
+
+**How it works.** citadel-helper (1.3 or newer) redirects the routed apps' TCP
+connections to a local port of `bin/citadel-proxy`. That process reads each
+connection's original destination and opens it through the proxy (SOCKS5
+CONNECT, HTTP CONNECT, or CONNECT over TLS for HTTPS proxies).
+
+**Host names.** Many proxies, filtering ones especially, refuse a tunnel to
+a bare IP address. Citadel reads the host name the app asks for (the TLS server
+name, or the HTTP `Host` header) and connects through the proxy by name. It
+uses that name only when it resolves to the address the firewall let through,
+so an app can't name some other host to get around a block.
+
+**Fails closed.** If the proxy is down or refuses, the app's connection is reset
+and never sent direct. The failure is logged in Settings and in History. The
+same holds when Citadel itself isn't running: the redirect stays, so routed apps
+get no connection at all.
+
+Good to know:
+- Only **TCP** is proxied. A routed app's UDP is blocked (except DNS), so browsers fall back from QUIC to TCP.
+- DNS still goes out through your normal resolver.
+- An app route is exact. A **host** route covers the addresses Citadel has resolved or seen for that host, so the very first connection to a brand-new address can take the default route. The policy editor warns about this.
+- Web apps share Chromium's process, so they can only be routed by host.
+- Proxy logins are kept in your desktop keyring (`secret-tool`), never in Citadel's files.
+- Routing needs enforcement on.
+
+## Explain
+
+The gate card shows the destination's **owner** straight away (e.g. *Owner:
+Google LLC*), from the free DB-IP ASN database. **Explain** goes further: it asks
+an AI agent which company and service is behind the connection, what it's
+likely for, and whether to allow or block it, e.g. *DoubleClick · Google — ad
+serving and tracking (ads). Suggests: Block*.
+
+- **Which agent.** Citadel asks your own Omarchy **default agent** (`omarchy agent --pick`) through its one-shot mode:
+
+  | Agent | Command |
+  |---|---|
+  | claude | `claude -p` |
+  | codex | `codex exec` |
+  | copilot | `copilot -p` |
+  | crush | `crush run` |
+  | cursor-agent | `cursor-agent -p` |
+  | gemini | `gemini -p` |
+  | opencode | `opencode run` |
+  | pi | `pi -p` |
+
+  - For any other tool, set a **custom command** in Settings, e.g. `mytool --print {prompt}`.
+  - With neither set, Explain stays off and the card says how to turn it on.
+- **Only on demand.** Nothing is sent until you press Explain.
+- **What it sends:** the app, its launcher, the command line with secrets masked, and the destination. A cloud agent sends these to its provider; a local one (e.g. pi with Ollama) keeps them on your network.
+- **Model and cost.** The agent uses its own default model. Settings has an optional model override, e.g. a small, fast one.
+- **Saved answers.** Answers are kept for 30 days per app, domain and port. **Ask again** gets a fresh one.
+- **Test.** The button in Settings checks the setup.
+
+## Import from AdGuard, Pi-hole and hosts files
+
+**Policies → Import ▸** takes:
+- AdGuard / AdGuard Home rules
+- Pi-hole allow and deny lists
+- hosts files
+- plain domain lists
+- Citadel's own export
+
+Paste them, or fetch them from a URL (GitHub page links work).
+
+| Rule | Becomes |
+|---|---|
+| `\|\|ads.example.com^` (also with `$important`) | a Block policy |
+| `@@\|\|good.example.com^` | an Allow policy (wins over a block of the same domain, as in AdGuard) |
+| `0.0.0.0 ads.example.com` | a Block policy |
+| a plain domain | Block or Allow, as you choose (Pi-hole allowlists are plain lists) |
+
+Up to 200 blocked domains become policies you can see and edit. Bigger lists,
+like HaGeZi or OISD, become a **feed**. Fetched from a URL, the feed refreshes daily.
+
+Regex rules and AdGuard options such as `$client=` or `$dnsrewrite` have no
+Citadel equivalent. They're skipped, and the import tells you how many.
+
+**Not a DNS ad blocker.** Citadel blocks connections per app, so a listed
+domain is caught when Citadel knows the connection's host name, from its own
+name lookups or the app's request. Pi-hole and AdGuard Home block the DNS
+lookup itself. They work well together.
 
 ## Enforcement
 
@@ -137,7 +286,7 @@ What the firewall never touches:
 ## Good to know
 
 - **The first packet may leave.** Citadel sees a new connection within one refresh, and a moment before it answers the gate. Every later attempt follows your verdict.
-- **Very short connections** can slip between refreshes. Set the refresh to 1 s to catch more.
+- **Very short connections** are caught through the kernel log when *Catch short connections* is on (helper 1.2+). Without it they can slip between refreshes.
 - **Command-line tools inside a terminal** share the terminal's scope, so their policies are enforced per destination within that scope. The policy is marked this way.
 - **Blocking an interpreter** (e.g. `python3.14`) blocks every program running on it.
 - **Host names come from reverse DNS.** CDNs may show their own names, and domain feeds only match names Citadel knows.
@@ -152,10 +301,16 @@ neat.citadel/
 ├── views/                       Traffic, Policies, History, Settings, VerdictCard
 ├── docs/screenshots/            images used in this README
 ├── bin/citadel-monitor          python watch process (ss, /proc, rDNS, GeoIP, sqlite)
+├── bin/citadel-proxy            per-app proxy tunnels (SOCKS5 / HTTP / HTTPS CONNECT)
+├── bin/citadel-explain          asks your agent about a connection (tests/test_explain.py)
 ~/.local/share/citadel/          state.json, history.db, feeds, GeoIP, enforce spec
 ```
 
-Run the logic tests with `node tests/model.test.js`.
+Tests:
+- `node tests/model.test.js`: logic
+- `python3 tests/test_explain.py`: Explain adapters, with fake agents
+- `python3 tests/test_proxy_unit.py`: host-name handling of the proxy (TLS server name, HTTP Host, resolution check)
+- `python3 tests/test_proxy_e2e.py`: proxy routing end to end, in a private network namespace (needs citadel-helper's source next to this repo, or `CITADEL_ENFORCER`)
 
 ## Third-party data
 
@@ -163,7 +318,7 @@ Citadel bundles no third-party data. It downloads these only when you ask:
 
 | Data | Publisher | When |
 |---|---|---|
-| Country database | [DB-IP Lite](https://db-ip.com), CC BY 4.0 | Settings → Download |
+| Country and network-owner (ASN) databases | [DB-IP Lite](https://db-ip.com), CC BY 4.0 | Settings → Download |
 | FireHOL Level 1 | [FireHOL](https://iplists.firehol.org/) | when you enable the feed |
 | Spamhaus DROP | [Spamhaus](https://www.spamhaus.org/blocklists/do-not-route-or-peer/) | when you enable the feed |
 | StevenBlack hosts | [StevenBlack/hosts](https://github.com/StevenBlack/hosts) | when you enable the feed |

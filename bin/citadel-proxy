@@ -1,0 +1,467 @@
+#!/usr/bin/env python3
+"""Citadel proxy: the user-level end of Citadel's per-app proxy routing.
+
+citadel-helper redirects the TCP connections of apps whose policy says
+"allow via proxy X" to a local port of this process (nft `redirect`). For
+each connection we read the original destination (SO_ORIGINAL_DST), open a
+tunnel to it through proxy X and copy bytes both ways.
+
+Fail closed: if the proxy can't be reached or refuses, the app's connection
+is reset instead of going direct, and an error event is printed.
+
+stdin (JSON lines):
+  {"cmd":"config","proxies":[{"id","name","type":"http"|"https"|"socks5",
+    "host","port","listen","auth":bool,"verifyTls":bool}],"checkEvery":30}
+  {"cmd":"check","id":"<proxy id>"}      full CONNECT test through a proxy
+stdout (JSON lines):
+  {"type":"status","id","ok","ms","error"}     health (every checkEvery s)
+  {"type":"error","id","dst","port","error"}  a routed connection failed
+  {"type":"stats","counts":{id: n}}           connections carried (5 s)
+  {"type":"check","id","ok","ms","error"}     result of a check command
+  {"type":"log","msg"}
+
+Credentials never pass through Citadel's settings: they are read from the
+desktop keyring (secret-tool lookup citadel-proxy <id>) as "user:password".
+Only the standard library is used.
+"""
+import asyncio
+import base64
+import ipaddress
+import json
+import os
+import re
+import socket
+import ssl
+import struct
+import subprocess
+import sys
+import time
+
+SO_ORIGINAL_DST = 80          # linux/netfilter_ipv4.h
+IP6T_SO_ORIGINAL_DST = 80     # linux/netfilter_ipv6/ip6_tables.h
+CONNECT_TIMEOUT = 10
+CHECK_TARGET = ("1.1.1.1", 443)
+
+proxies = {}                  # id -> config dict (+ "cred")
+servers = {}                  # id -> [asyncio servers]
+counts = {}
+
+
+def emit(obj):
+    try:
+        sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+    except BrokenPipeError:
+        os._exit(0)
+
+
+def keyring_credentials(pid):
+    """-> (user, password) from the desktop keyring, or None."""
+    try:
+        p = subprocess.run(["secret-tool", "lookup", "citadel-proxy", pid],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    secret = p.stdout.rstrip("\n")
+    if p.returncode != 0 or ":" not in secret:
+        return None
+    user, _, password = secret.partition(":")
+    return user, password
+
+
+# ------------------------------------------------------------------ destination
+
+def original_destination(sock):
+    """(ip, port) the app originally connected to, before nft redirected it."""
+    if sock.family == socket.AF_INET6:
+        raw = sock.getsockopt(socket.SOL_IPV6, IP6T_SO_ORIGINAL_DST, 28)
+        port = struct.unpack_from("!H", raw, 2)[0]
+        ip = ipaddress.IPv6Address(raw[8:24])
+        if ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        return str(ip), port
+    raw = sock.getsockopt(socket.SOL_IP, SO_ORIGINAL_DST, 16)
+    port = struct.unpack_from("!H", raw, 2)[0]
+    return socket.inet_ntoa(raw[4:8]), port
+
+
+# ------------------------------------------------------------------ upstream
+
+async def open_proxy(px):
+    """TCP (or TLS for https proxies) connection to the proxy server."""
+    tls = None
+    if px["type"] == "https":
+        tls = ssl.create_default_context()
+        if px.get("verifyTls") is False:
+            tls.check_hostname = False
+            tls.verify_mode = ssl.CERT_NONE
+    return await asyncio.wait_for(
+        asyncio.open_connection(px["host"], int(px["port"]), ssl=tls,
+                                server_hostname=px["host"] if tls else None),
+        CONNECT_TIMEOUT)
+
+
+async def readexactly(reader, n):
+    return await asyncio.wait_for(reader.readexactly(n), CONNECT_TIMEOUT)
+
+
+async def socks5_connect(reader, writer, px, ip, port):
+    cred = px.get("cred")
+    writer.write(b"\x05\x02\x00\x02" if cred else b"\x05\x01\x00")
+    await writer.drain()
+    ver, method = await readexactly(reader, 2)
+    if ver != 5:
+        raise ConnectionError("not a SOCKS5 proxy")
+    if method == 0x02:
+        if not cred:
+            raise ConnectionError("proxy wants a username/password")
+        u, p = cred[0].encode(), cred[1].encode()
+        writer.write(b"\x01" + bytes([len(u)]) + u + bytes([len(p)]) + p)
+        await writer.drain()
+        _, status = await readexactly(reader, 2)
+        if status != 0:
+            raise ConnectionError("proxy rejected the username/password")
+    elif method != 0x00:
+        raise ConnectionError("proxy offers no usable login method")
+    try:
+        addr = ipaddress.ip_address(ip)
+        atyp, packed = (b"\x01", addr.packed) if addr.version == 4 else (b"\x04", addr.packed)
+    except ValueError:                         # a verified host name (see sniff)
+        name = ip.encode("ascii")
+        atyp, packed = b"\x03", bytes([len(name)]) + name
+    writer.write(b"\x05\x01\x00" + atyp + packed + struct.pack("!H", port))
+    await writer.drain()
+    ver, rep, _, batyp = await readexactly(reader, 4)
+    if rep != 0:
+        reasons = {1: "general failure", 2: "not allowed by ruleset", 3: "network unreachable",
+                   4: "host unreachable", 5: "connection refused", 6: "TTL expired"}
+        raise ConnectionError("proxy: " + reasons.get(rep, "error %d" % rep))
+    skip = {1: 4, 4: 16}.get(batyp)
+    if skip is None:
+        skip = (await readexactly(reader, 1))[0]
+    await readexactly(reader, skip + 2)
+
+
+async def http_connect(reader, writer, px, ip, port):
+    host = "[%s]" % ip if ":" in ip else ip      # an IP, or a verified host name
+    lines = ["CONNECT %s:%d HTTP/1.1" % (host, port), "Host: %s:%d" % (host, port)]
+    cred = px.get("cred")
+    if cred:
+        token = base64.b64encode(("%s:%s" % cred).encode()).decode()
+        lines.append("Proxy-Authorization: Basic " + token)
+    writer.write(("\r\n".join(lines) + "\r\n\r\n").encode())
+    await writer.drain()
+    head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), CONNECT_TIMEOUT)
+    status = head.split(b"\r\n", 1)[0].split()
+    if len(status) < 2 or status[1] != b"200":
+        raise ConnectionError("proxy answered " + head.split(b"\r\n", 1)[0].decode("latin-1")[:80])
+
+
+async def tunnel(px, ip, port):
+    reader, writer = await open_proxy(px)
+    try:
+        if px["type"] == "socks5":
+            await socks5_connect(reader, writer, px, ip, port)
+        else:
+            await http_connect(reader, writer, px, ip, port)
+    except BaseException:
+        writer.close()
+        raise
+    return reader, writer
+
+
+# ------------------------------------------------------------------ piping
+
+async def pipe(src, dst):
+    try:
+        while True:
+            data = await src.read(65536)
+            if not data:
+                break
+            dst.write(data)
+            await dst.drain()
+    except (ConnectionError, OSError, asyncio.IncompleteReadError):
+        pass
+    finally:
+        try:
+            if dst.can_write_eof():
+                dst.write_eof()
+        except (OSError, RuntimeError):
+            pass
+
+
+def reset(writer):
+    """Close the app's side with a TCP reset: it must not think it got through."""
+    try:
+        sock = writer.get_extra_info("socket")
+        if sock is not None:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    except OSError:
+        pass
+    writer.transport.abort()
+
+
+# ------------------------------------------------------------------ host name
+#
+# The redirect only tells us the destination IP. Many proxies (filtering and
+# corporate ones in particular) refuse or break a CONNECT to a bare IP, so we
+# read the host name the app is asking for from its first bytes: the TLS
+# ClientHello's server name, or the HTTP Host header. The app chooses those
+# bytes, so the name is only used when it resolves to the IP the firewall
+# already let through; otherwise the tunnel goes to the IP as before.
+
+HOST_RE = re.compile(r"^(?=.{1,253}$)([A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?)(\.[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?)*\.?$")
+SNIFF_TIMEOUT = 1.0          # protocols where the server talks first get nothing
+
+
+def tls_server_name(data):
+    """Server name from a TLS ClientHello, or None (also when incomplete)."""
+    try:
+        if len(data) < 5 or data[0] != 0x16:
+            return None
+        end = 5 + struct.unpack("!H", data[3:5])[0]
+        if len(data) < end or data[5] != 0x01:
+            return None
+        i = 5 + 4 + 2 + 32                     # handshake header, version, random
+        i += 1 + data[i]                       # session id
+        i += 2 + struct.unpack("!H", data[i:i + 2])[0]   # cipher suites
+        i += 1 + data[i]                       # compression methods
+        ext_end = i + 2 + struct.unpack("!H", data[i:i + 2])[0]
+        i += 2
+        while i + 4 <= min(ext_end, end):
+            etype, elen = struct.unpack("!HH", data[i:i + 4])
+            i += 4
+            if etype == 0:                     # server_name
+                j = i + 2
+                while j + 3 <= i + elen:
+                    ntype, nlen = data[j], struct.unpack("!H", data[j + 1:j + 3])[0]
+                    if ntype == 0:
+                        return data[j + 3:j + 3 + nlen].decode("ascii")
+                    j += 3 + nlen
+                return None
+            i += elen
+    except (IndexError, struct.error, UnicodeDecodeError):
+        return None
+    return None
+
+
+def http_host(data):
+    head, sep, _ = data.partition(b"\r\n\r\n")
+    if not sep and len(data) < 8192:
+        return None
+    for line in head.split(b"\r\n")[1:]:
+        k, _, v = line.partition(b":")
+        if k.strip().lower() == b"host":
+            h = v.strip().decode("ascii", "replace")
+            return h.rsplit(":", 1)[0] if not h.startswith("[") else None
+    return None
+
+
+async def sniff(reader):
+    """-> (host name or None, bytes already read from the app)."""
+    data = b""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + SNIFF_TIMEOUT
+    while len(data) < 16384:
+        left = deadline - loop.time()
+        if left <= 0:
+            break
+        try:
+            chunk = await asyncio.wait_for(reader.read(16384 - len(data)), left)
+        except asyncio.TimeoutError:
+            break
+        if not chunk:
+            break
+        data += chunk
+        if data[:1] == b"\x16":
+            name = tls_server_name(data)
+            if name or (len(data) >= 5 and len(data) >= 5 + struct.unpack("!H", data[3:5])[0]):
+                return name, data
+        elif data[:1].isalpha():
+            if b"\r\n\r\n" in data:
+                return http_host(data), data
+        else:
+            return None, data
+    if data[:1] == b"\x16":
+        return tls_server_name(data), data
+    return (http_host(data) if data[:1].isalpha() else None), data
+
+
+async def verified_name(name, ip):
+    """name, if it is a valid host name that resolves to ip; else None."""
+    if not name or not HOST_RE.match(name):
+        return None
+    try:
+        ipaddress.ip_address(name)
+        return None                            # already an address
+    except ValueError:
+        pass
+    try:
+        infos = await asyncio.wait_for(asyncio.get_running_loop().getaddrinfo(name, None), 3)
+    except (OSError, asyncio.TimeoutError, UnicodeError):
+        return None
+    want = ipaddress.ip_address(ip)
+    for info in infos:
+        try:
+            got = ipaddress.ip_address(info[4][0].split("%")[0])
+        except ValueError:
+            continue
+        if got == want or (got.version == 6 and got.ipv4_mapped == want):
+            return name.rstrip(".")
+    return None
+
+
+def make_handler(pid):
+    async def handle(creader, cwriter):
+        px = proxies.get(pid)
+        try:
+            ip, port = original_destination(cwriter.get_extra_info("socket"))
+        except OSError:
+            reset(cwriter)
+            return
+        local = cwriter.get_extra_info("sockname")
+        if px is None or (local and ip in ("127.0.0.1", "::1") and port == local[1]):
+            reset(cwriter)                     # not a redirected connection
+            return
+        name, early = await sniff(creader)
+        target = await verified_name(name, ip) or ip
+        if name and target == ip:
+            emit({"type": "log", "msg": "%s does not resolve to %s; tunnelling to the address" % (name[:80], ip)})
+        try:
+            ureader, uwriter = await tunnel(px, target, port)
+            if early:
+                uwriter.write(early)
+                await uwriter.drain()
+        except (OSError, ConnectionError, asyncio.TimeoutError, asyncio.IncompleteReadError, ssl.SSLError) as e:
+            emit({"type": "error", "id": pid, "dst": ip, "port": port, "error": describe(e, px)})
+            reset(cwriter)
+            return
+        counts[pid] = counts.get(pid, 0) + 1
+        await asyncio.gather(pipe(creader, uwriter), pipe(ureader, cwriter))
+        for w in (uwriter, cwriter):
+            try:
+                w.close()
+            except (OSError, RuntimeError):
+                pass
+    return handle
+
+
+# ------------------------------------------------------------------ control
+
+async def start_listeners(pid, port):
+    srv = []
+    for host in ("127.0.0.1", "::1"):
+        try:
+            srv.append(await asyncio.start_server(make_handler(pid), host, port, reuse_address=True))
+        except OSError as e:
+            emit({"type": "log", "msg": "cannot listen on %s:%d: %s" % (host, port, e)})
+    servers[pid] = srv
+
+
+async def stop_listeners(pid):
+    for s in servers.pop(pid, []):
+        s.close()
+        await s.wait_closed()
+
+
+async def apply_config(cfg):
+    wanted = {}
+    for p in cfg.get("proxies") or []:
+        try:
+            pid, ptype = str(p["id"]), p["type"]
+            if ptype not in ("http", "https", "socks5"):
+                raise ValueError("bad type")
+            entry = {"id": pid, "name": p.get("name") or pid, "type": ptype, "host": str(p["host"]),
+                     "port": int(p["port"]), "listen": int(p["listen"]), "verifyTls": p.get("verifyTls", True)}
+        except (KeyError, ValueError, TypeError):
+            emit({"type": "log", "msg": "ignoring bad proxy entry"})
+            continue
+        if p.get("auth"):
+            entry["cred"] = keyring_credentials(pid)
+            if entry["cred"] is None:
+                emit({"type": "status", "id": pid, "ok": False, "ms": 0,
+                      "error": "no username/password in the keyring"})
+        wanted[pid] = entry
+    for pid in list(servers):
+        if pid not in wanted or wanted[pid]["listen"] != proxies.get(pid, {}).get("listen"):
+            await stop_listeners(pid)
+    proxies.clear()
+    proxies.update(wanted)
+    for pid, entry in wanted.items():
+        if pid not in servers:
+            await start_listeners(pid, entry["listen"])
+
+
+def describe(e, px):
+    """Readable error text; points out the usual HTTP-vs-HTTPS mix-up."""
+    text = str(e)[:200] or type(e).__name__
+    if px and px.get("type") == "https" and "WRONG_VERSION_NUMBER" in text:
+        return "the proxy answered without TLS: it looks like a plain HTTP proxy, set its type to HTTP"
+    return text
+
+
+async def health(pid, full=False):
+    px = proxies.get(pid)
+    if not px:
+        return {"id": pid, "ok": False, "ms": 0, "error": "unknown proxy"}
+    t0 = time.monotonic()
+    try:
+        if full:
+            reader, writer = await tunnel(px, *CHECK_TARGET)
+        else:
+            reader, writer = await open_proxy(px)
+        writer.close()
+        return {"id": pid, "ok": True, "ms": int((time.monotonic() - t0) * 1000), "error": ""}
+    except (OSError, ConnectionError, asyncio.TimeoutError, asyncio.IncompleteReadError, ssl.SSLError) as e:
+        return {"id": pid, "ok": False, "ms": int((time.monotonic() - t0) * 1000),
+                "error": describe(e, px)}
+
+
+async def report_status():
+    for pid in list(proxies):
+        emit(dict(await health(pid), type="status"))
+
+
+async def health_loop(state):
+    while True:
+        await report_status()
+        await asyncio.sleep(max(5, int(state.get("checkEvery", 30))))
+
+
+async def stats_loop():
+    while True:
+        await asyncio.sleep(5)
+        if counts:
+            emit({"type": "stats", "counts": dict(counts)})
+            counts.clear()
+
+
+async def main():
+    loop = asyncio.get_running_loop()
+    reader = asyncio.StreamReader()
+    await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), sys.stdin)
+    state = {"checkEvery": 30}
+    tasks = [asyncio.create_task(health_loop(state)), asyncio.create_task(stats_loop())]
+    while True:
+        line = await reader.readline()
+        if not line:
+            break                              # Citadel went away: stop
+        try:
+            cmd = json.loads(line)
+        except ValueError:
+            continue
+        if cmd.get("cmd") == "config":
+            state["checkEvery"] = cmd.get("checkEvery", 30)
+            await apply_config(cmd)
+            asyncio.create_task(report_status())    # new proxies get a status at once
+        elif cmd.get("cmd") == "check":
+            emit(dict(await health(str(cmd.get("id")), full=True), type="check"))
+    for t in tasks:
+        t.cancel()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

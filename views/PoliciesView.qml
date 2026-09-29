@@ -13,11 +13,17 @@ Column {
   property var p: null
   property var s: null
   property string filterProfile: "*all*"
+  property string listQuery: ""
+  property string listShow: "all"            // all | you | gate | deny | proxy
+  property string listSort: "newest"         // newest | precedence
+  property string highlightId: ""            // the policy just saved
   property string editId: ""
   property string formApp: "*"
-  property string formAction: "deny"
+  property string formVia: "*"
+  property string formAction: "deny"           // deny | allow | proxy (allow via a proxy)
   property string formProfile: "*"
   property string formDuration: "forever"
+  property string formRoute: "default"
   property string message: ""
 
   spacing: Style.space(8)
@@ -34,29 +40,53 @@ Column {
     })
     return out
   }
+  // launchers seen in traffic (and in existing policies) for "Started by"
+  readonly property var viaChoices: {
+    var seen = { "*": true }
+    var out = [{ value: "*", label: "However it starts" }]
+    function add(id, name, kind) {
+      if (!id || seen[id]) return
+      seen[id] = true
+      out.push({ value: id, label: (kind === "terminal" ? "in " : "via ") + (name || Model.viaLabel(id)) + (id.indexOf("/") === 0 ? "  —  " + id : "") })
+    }
+    s.conns.forEach(function(c) { if (!c.system && (formApp === "*" || c.exe === formApp)) add(c.viaId, c.via, c.viaKind) })
+    s.rules.forEach(function(r) { if (r.via && r.via !== "*") add(r.via, Model.viaLabel(r.via), "") })
+    return out
+  }
+  // "Allow via proxy": which proxy. Direct is offered only when everything
+  // else already goes through a proxy (otherwise plain Allow is direct).
+  readonly property var routeChoices: s.proxies.map(function(x) { return { value: x.id, label: x.name + "  —  " + x.type.toUpperCase() + " " + x.host + ":" + x.port } })
+    .concat(s.defaultRoute !== "direct" ? [{ value: "direct", label: "Direct (skip the proxy)" }] : [])
   readonly property var profileChoices: [{ value: "*", label: "All zones" }].concat(
     s.profiles.map(function(pr) { return { value: pr.name, label: pr.name + " zone" } }))
-  readonly property var shownRules: s.rules.filter(function(r) {
-    return filterProfile === "*all*" || r.profile === filterProfile || r.profile === "*"
-  }).slice().sort(function(a, b) { return Model.specificity(b) - Model.specificity(a) || b.createdAt - a.createdAt })
+  readonly property var shownRules: Model.filterRules(s.rules,
+    { query: listQuery, show: listShow, sort: listSort, profile: filterProfile }, s.proxyName)
 
   function describe(r) {
-    var who = r.app === "*" ? "Any app" : r.app.split("/").pop()
+    var who = (r.app === "*" ? "Any app" : r.app.split("/").pop())
+              + (r.via && r.via !== "*" ? " via " + Model.viaLabel(r.via) : "")
     var where = r.host === "*" ? "every host" : r.host
     return who + "  →  " + where + (r.port !== "*" ? ":" + r.port : "")
+           + (r.action === "allow" && r.route && r.route !== "default"
+              ? (r.route === "direct" ? "  · direct" : "  · via " + s.proxyName(r.route)) : "")
   }
   // Dropdowns overwrite their own `value` when used, which breaks a binding,
   // so the form pushes values into them explicitly.
   function _syncForm() {
-    appDrop.value = formApp; zoneDrop.value = formProfile
+    appDrop.value = formApp; viaDrop.value = formVia; zoneDrop.value = formProfile
+    if (formAction === "proxy") routeDrop.value = formRoute
   }
   function resetForm() {
-    editId = ""; formApp = "*"; formAction = "deny"; formProfile = "*"; formDuration = "forever"
+    editId = ""; formApp = "*"; formVia = "*"; formAction = "deny"; formProfile = "*"; formDuration = "forever"; formRoute = "default"
     hostField.text = ""; portField.text = ""
     _syncForm()
   }
   function edit(r) {
-    editId = r.id; formApp = r.app; formAction = r.action; formProfile = r.profile
+    editId = r.id; formApp = r.app; formVia = r.via || "*"; formProfile = r.profile
+    var routed = r.action === "allow" && r.route && r.route !== "default"
+                 && !(r.route === "direct" && s.defaultRoute === "direct")
+    formAction = routed ? "proxy" : r.action
+    formRoute = routed ? r.route : "default"
     formDuration = r.duration === "untilQuit" ? "untilQuit" : "forever"
     hostField.text = r.host === "*" ? "" : r.host
     portField.text = r.port === "*" ? "" : String(r.port)
@@ -69,11 +99,23 @@ Column {
     var port = portField.text.trim() || "*"
     if (formApp === "*" && host === "*") { message = "Choose an app, a host, or both."; return }
     if (port !== "*" && !(Number(port) >= 1 && Number(port) <= 65535)) { message = "Port must be 1–65535."; return }
-    var fields = { app: formApp, host: host, port: port, action: formAction, profile: formProfile,
+    if (formAction === "proxy" && (formRoute === "default" || !routeChoices.some(function(c) { return c.value === formRoute }))) {
+      message = s.proxies.length ? "Pick a proxy." : "Add a proxy in Settings first."; return
+    }
+    var fields = { app: formApp, via: formApp === "*" ? "*" : formVia, host: host, port: port,
+                   action: formAction === "deny" ? "deny" : "allow", profile: formProfile,
+                   route: formAction === "proxy" ? formRoute : "default",
                    duration: formDuration,
                    pids: formDuration === "untilQuit" && s.apps[formApp] ? s.apps[formApp].pids : [] }
-    if (editId) s.updateRule(editId, fields); else s.addRule(fields)
+    var savedId = editId
+    if (editId) s.updateRule(editId, fields); else savedId = s.addRule(fields).id
     var done = editId ? "Policy updated." : "Policy added."
+    // show it where it can be found: at the top of "Added by you"
+    listQuery = ""; searchField.text = ""
+    if (listShow !== "all" && listShow !== "you") listShow = "you"
+    listSort = "newest"
+    highlightId = savedId
+    highlightTimer.restart()
     resetForm()
     message = done
   }
@@ -91,10 +133,7 @@ Column {
     id: pasteProc
     command: ["wl-paste", "--no-newline"]
     stdout: StdioCollector { id: pasteOut; waitForEnd: true }
-    onExited: {
-      var err = root.s.importRules(String(pasteOut.text || ""))
-      root.message = err ? "Import failed: " + err : "Policies imported from the clipboard."
-    }
+    onExited: importPanel.importPasted(String(pasteOut.text || ""))
   }
 
   // ---------------------------------------------------------------- list
@@ -102,7 +141,15 @@ Column {
     width: parent.width
     PanelSectionHeader { text: "POLICIES"; foreground: root.p.foreground; fontFamily: root.p.fontFamily; Layout.fillWidth: true }
     LinkButton { p: root.p; text: "Export"; onClicked: { copyProc.payload = root.s.exportRules(); copyProc.running = true } }
-    LinkButton { p: root.p; text: "Import"; onClicked: pasteProc.running = true }
+    LinkButton { p: root.p; text: importPanel.visible ? "Import ▾" : "Import ▸"; onClicked: importPanel.visible = !importPanel.visible }
+  }
+  ImportPanel {
+    id: importPanel
+    visible: false
+    width: parent.width
+    p: root.p
+    s: root.s
+    onPasteRequested: pasteProc.running = true
   }
   // ---------------------------------------------------------------- form
   PanelSectionHeader { text: root.editId ? "EDIT POLICY" : "NEW POLICY"; foreground: root.p.foreground; fontFamily: root.p.fontFamily }
@@ -113,7 +160,26 @@ Column {
     value: root.formApp
     options: root.appChoices
     foreground: root.p.foreground
-    onChanged: function(v) { root.formApp = v }
+    onChanged: function(v) { root.formApp = v; root.formVia = "*" }
+  }
+  Dropdown {
+    id: viaDrop
+    width: parent.width
+    visible: root.formApp !== "*" && root.viaChoices.length > 1
+    label: "Started by"
+    value: root.formVia
+    options: root.viaChoices
+    foreground: root.p.foreground
+    onChanged: function(v) { root.formVia = v }
+  }
+  // styled like the Dropdown labels above it
+  Text {
+    text: "Destination (where the app connects)"
+    textFormat: Text.PlainText
+    color: Qt.darker(root.p.foreground, 1.4)
+    font.family: root.p.fontFamily
+    font.pixelSize: Style.font.caption
+    font.bold: true
   }
   RowLayout {
     width: parent.width
@@ -121,7 +187,7 @@ Column {
     TextField {
       id: hostField
       Layout.fillWidth: true
-      placeholderText: "host, domain, IP or CIDR (empty = any)"
+      placeholderText: "host, domain, IP or CIDR (empty = anywhere)"
       foreground: root.p.foreground
       onAccepted: root.submit()
     }
@@ -137,13 +203,24 @@ Column {
     width: parent.width
     spacing: Style.space(10)
     ButtonGroup {
-      options: [{ value: "deny", label: "Block" }, { value: "allow", label: "Allow" }]
+      options: [{ value: "deny", label: "Block" }, { value: "allow", label: "Allow" },
+                { value: "proxy", label: "Allow via proxy" }]
       value: root.formAction
       foreground: root.p.foreground
       fontFamily: root.p.fontFamily
       fontSize: Style.font.caption
-      onChanged: function(v) { root.formAction = v }
+      onChanged: function(v) {
+        root.formAction = v
+        if (v === "proxy" && root.formRoute === "default" && root.routeChoices.length) {
+          root.formRoute = root.routeChoices[0].value
+          routeDrop.value = root.formRoute
+        }
+      }
     }
+  }
+  RowLayout {
+    width: parent.width
+    spacing: Style.space(10)
     ButtonGroup {
       options: [{ value: "forever", label: "From now on" }, { value: "untilQuit", label: "Until the app quits" }]
       value: root.formDuration
@@ -152,6 +229,42 @@ Column {
       fontSize: Style.font.caption
       onChanged: function(v) { root.formDuration = v }
     }
+  }
+  Dropdown {
+    id: routeDrop
+    width: parent.width
+    visible: root.formAction === "proxy" && root.s.proxies.length > 0
+    label: "Proxy"
+    value: root.formRoute
+    options: root.routeChoices
+    foreground: root.p.foreground
+    onChanged: function(v) { root.formRoute = v }
+  }
+  RowLayout {
+    width: parent.width
+    spacing: Style.space(8)
+    visible: root.formAction === "proxy" && root.s.proxies.length === 0
+    Lbl {
+      p: root.p
+      Layout.fillWidth: true
+      dim: true
+      wrapMode: Text.WordWrap
+      maximumLineCount: 2
+      font.pixelSize: Style.font.caption
+      text: "No proxies yet. Add one in Settings, then pick it here."
+    }
+    LinkButton { p: root.p; text: "Add a proxy"; onClicked: root.p.view = "settings" }
+  }
+  Lbl {
+    p: root.p
+    width: parent.width
+    visible: routeDrop.visible && root.formRoute !== "direct"
+             && root.formApp === "*" && hostField.text.trim() !== ""
+    wrapMode: Text.WordWrap
+    maximumLineCount: 3
+    dim: true
+    font.pixelSize: Style.font.caption
+    text: "A host-only proxy route covers the addresses Citadel has resolved or seen for that host; the first connection to a brand-new address may use the default route. Pick an app for an exact route."
   }
   Dropdown {
     id: zoneDrop
@@ -182,13 +295,51 @@ Column {
   }
 
   PanelSeparator { foreground: root.p.foreground }
+  Timer { id: highlightTimer; interval: 8000; onTriggered: root.highlightId = "" }
+  TextField {
+    id: searchField
+    width: parent.width
+    placeholderText: "search app, host, IP or proxy"
+    foreground: root.p.foreground
+    onTextChanged: root.listQuery = text
+  }
   ButtonGroup {
-    options: [{ value: "*all*", label: "All zones" }].concat(root.s.profiles.map(function(pr) { return { value: pr.name, label: pr.name } }))
-    value: root.filterProfile
+    options: [{ value: "all", label: "All" }, { value: "you", label: "Added by you" }, { value: "gate", label: "From the gate" },
+              { value: "deny", label: "Blocks" }, { value: "proxy", label: "Via proxy" }]
+    value: root.listShow
     foreground: root.p.foreground
     fontFamily: root.p.fontFamily
     fontSize: Style.font.caption
-    onChanged: function(v) { root.filterProfile = v }
+    onChanged: function(v) { root.listShow = v }
+  }
+  RowLayout {
+    width: parent.width
+    spacing: Style.space(8)
+    ButtonGroup {
+      visible: root.s.profiles.length > 1
+      options: [{ value: "*all*", label: "All zones" }].concat(root.s.profiles.map(function(pr) { return { value: pr.name, label: pr.name } }))
+      value: root.filterProfile
+      foreground: root.p.foreground
+      fontFamily: root.p.fontFamily
+      fontSize: Style.font.caption
+      onChanged: function(v) { root.filterProfile = v }
+    }
+    ButtonGroup {
+      options: [{ value: "newest", label: "Newest" }, { value: "precedence", label: "Precedence" }]
+      value: root.listSort
+      foreground: root.p.foreground
+      fontFamily: root.p.fontFamily
+      fontSize: Style.font.caption
+      onChanged: function(v) { root.listSort = v }
+    }
+    Lbl {
+      p: root.p
+      Layout.fillWidth: true
+      horizontalAlignment: Text.AlignRight
+      dim: true
+      font.pixelSize: Style.font.caption
+      text: root.shownRules.length + " of " + root.s.rules.length
+    }
   }
   Lbl {
     p: root.p
@@ -197,13 +348,29 @@ Column {
     width: parent.width
     wrapMode: Text.WordWrap
     maximumLineCount: 3
-    text: "No policies yet. Choose “Always allow” or “Block” at the gate, use Allow / Block in Traffic, or add one below."
+    text: root.s.rules.length === 0
+          ? "No policies yet. Choose “Always allow” or “Block” at the gate, use Allow / Block in Traffic, or add one above."
+          : "No policy matches."
   }
   Repeater {
     model: root.shownRules
-    delegate: RowLayout {
+    delegate: Item {
+      id: ruleItem
       required property var modelData
       width: root.width
+      height: ruleRow.implicitHeight
+      // the policy just saved stands out for a few seconds
+      Rectangle {
+        anchors.fill: parent
+        anchors.margins: -Style.space(3)
+        radius: Style.cornerRadius
+        visible: root.highlightId === ruleItem.modelData.id
+        color: Qt.rgba(root.p.foreground.r, root.p.foreground.g, root.p.foreground.b, 0.10)
+      }
+      RowLayout {
+      id: ruleRow
+      readonly property var modelData: ruleItem.modelData
+      width: parent.width
       spacing: Style.space(8)
       Lbl {
         p: root.p
@@ -220,7 +387,8 @@ Column {
           width: parent.width
           dim: true
           font.pixelSize: Style.font.caption
-          text: (modelData.profile === "*" ? "all zones" : modelData.profile + " zone")
+          text: (modelData.origin === "gate" ? "from the gate " : "added by you ") + Model.ago(modelData.createdAt, root.s.now)
+                + " · " + (modelData.profile === "*" ? "all zones" : modelData.profile + " zone")
                 + (modelData.duration === "untilQuit" ? " · until the app quits" : "")
                 + (root.s.approx[modelData.id] ? " · per destination (app shares its group)" : "")
                 + (modelData.note ? " · " + modelData.note : "")
@@ -233,6 +401,7 @@ Column {
         onClicked: root.editId === modelData.id ? root.resetForm() : root.edit(modelData)
       }
       LinkButton { p: root.p; danger: true; text: "Remove"; onClicked: root.s.removeRule(modelData.id) }
+      }
     }
   }
 
