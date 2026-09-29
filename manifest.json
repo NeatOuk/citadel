@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "neat.citadel",
   "name": "Citadel",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "author": "Neat Ouk",
   "license": "MIT",
   "description": "An outbound firewall in your bar. When an app connects somewhere new, it waits at the gate: see the app, its integrity, host, country and port, then Block, Allow once or Always allow. Policies per app, zones per network, threat feeds, live traffic and history. Watching works on its own; to block, install citadel-helper (github.com/NeatOuk/citadel-helper), a small root package that applies your policies with nftables.",
