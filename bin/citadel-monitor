@@ -307,6 +307,99 @@ def _rdns(ip):
     rdns_pending.discard(ip)
 
 
+# Names apps looked up, from the system resolver (Linux: systemd-resolved's
+# query monitor): address -> [name, time]. Better than reverse DNS, which
+# gives nothing for most CDNs or a name made from the address itself.
+dns_names = {}
+dns_lock = threading.Lock()
+dns_state = {"state": "off", "error": "", "seen": 0}      # off | on | denied | unavailable
+
+
+def learn_names(msg):
+    """One query result: every answered address -> the name that was asked
+    (the app's name, not the CDN's canonical one)."""
+    asked = [str(q.get("name") or "").rstrip(".").lower() for q in msg.get("question") or []]
+    asked = [a for a in asked if a]
+    if msg.get("state") != "success" or not asked:
+        return 0
+    n, now = 0, time.time()
+    with dns_lock:
+        for a in msg.get("answer") or []:
+            addr = ((a.get("rr") or {}).get("address")) or []
+            try:
+                ip = str(ipaddress.ip_address(bytes(addr))) if len(addr) in (4, 16) else ""
+            except ValueError:
+                ip = ""
+            if ip:
+                dns_names[ip] = [asked[0], now]
+                n += 1
+        if len(dns_names) > 20000:
+            for ip, _ in sorted(dns_names.items(), key=lambda kv: kv[1][1])[:5000]:
+                del dns_names[ip]
+    dns_state["seen"] += n
+    return n
+
+
+def dns_name(ip):
+    with dns_lock:
+        hit = dns_names.get(ip)
+    return hit[0] if hit and time.time() - hit[1] < 86400 else None
+
+
+def host_name(ip, known=""):
+    """The best name for an address: the one this connection already has,
+    the one an app looked up, else reverse DNS."""
+    return known or dns_name(ip) or rdns(ip)
+
+
+RESOLVE_MONITOR = os.environ.get("CITADEL_RESOLVE_MONITOR", "/run/systemd/resolve/io.systemd.Resolve.Monitor")
+
+
+def dns_follower():
+    """Follow systemd-resolved's query results (varlink), so connections get
+    the names apps asked for. Reading them needs polkit's
+    org.freedesktop.resolve1.subscribe-query-results, which citadel-helper
+    1.3.2 grants the admin group. Never asks for a password: without the
+    permission the resolver refuses at once, and it's tried again later."""
+    while True:
+        wait = 60
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.connect(RESOLVE_MONITOR)
+            s.sendall(json.dumps({"method": "io.systemd.Resolve.Monitor.SubscribeQueryResults",
+                                  "more": True}).encode() + b"\0")
+            buf = b""
+            while True:
+                data = s.recv(65536)
+                if not data:
+                    break
+                buf += data
+                while b"\0" in buf:
+                    raw, buf = buf.split(b"\0", 1)
+                    msg = json.loads(raw.decode("utf-8", "replace"))
+                    if msg.get("error"):
+                        denied = msg["error"] in ("io.systemd.InteractiveAuthenticationRequired",
+                                                  "org.varlink.service.PermissionDenied")
+                        dns_state.update(state="denied" if denied else "unavailable", error=msg["error"])
+                        raise ConnectionError(msg["error"])
+                    dns_state.update(state="on", error="")
+                    learn_names(msg.get("parameters") or {})
+            dns_state.update(state="unavailable", error="the resolver closed the connection")
+            wait = 5
+        except FileNotFoundError:
+            dns_state.update(state="unavailable", error="systemd-resolved is not running")
+            wait = 300
+        except (OSError, ValueError) as e:
+            if dns_state["state"] not in ("denied", "unavailable"):
+                dns_state.update(state="unavailable", error=str(e))
+        finally:
+            try:
+                s.close()
+            except (OSError, UnboundLocalError):
+                pass
+        time.sleep(wait)
+
+
 def rdns(ip):
     hit = rdns_cache.get(ip)
     if hit and time.time() - hit[1] < 3600:
@@ -1217,7 +1310,7 @@ def short_connections(conns, prev_keys):
         o = (rec or {}).get("origin") or {}
         v = o.get("via") or {}
         exe = (rec or {}).get("exe", "")
-        host = rdns(ev["dst"])
+        host = host_name(ev["dst"])
         out.append({
             "key": "short|%s|%d|%s|%d|%.3f" % (ev["proto"], ev["spt"], ev["dst"], ev["dpt"], ev["ts"]),
             "short": True, "ts": ev["ts"], "confidence": conf,
@@ -1271,7 +1364,7 @@ def tick(hist, prev, table_cache):
         dt = max(0.5, now - p["ts"]) if p else 0
         up_rate = max(0, (r["up"] - p["up"]) / dt) if p else 0
         down_rate = max(0, (r["down"] - p["down"]) / dt) if p else 0
-        host = rdns(r["raddr"])
+        host = host_name(r["raddr"], p.get("host", "") if p else "")
         c = {"key": key, "proto": r["proto"], "state": r["state"].lower(),
              "raddr": r["raddr"], "rport": r["rport"], "lport": r["lport"],
              "pid": r["pid"], "exe": exe, "app": app_name(exe, r["comm"], r["cgroup"]),
@@ -1284,7 +1377,7 @@ def tick(hist, prev, table_cache):
             # Citadel's own proxy tunnels: the app's side is shown separately
             c.update(app="Citadel proxy", via="", viaId="", viaKind="")
         conns.append(c)
-    nextprev = {c["key"]: {"ts": now, "up": c["up"], "down": c["down"],
+    nextprev = {c["key"]: {"ts": now, "up": c["up"], "down": c["down"], "host": c["host"],
                            "sock": (c["lport"], c["raddr"], c["rport"])} for c in conns}
     short = short_connections(conns, {p["sock"] for p in prev.values() if "sock" in p})
 
@@ -1307,6 +1400,7 @@ def tick(hist, prev, table_cache):
           "totals": {"rx": rx, "tx": tx}, "network": {"names": net["names"], "ssid": net["ssid"], "source": net["source"]},
           "short": short,
           "kernelLog": {"running": kernel_state["running"], "error": kernel_state["error"], "seen": kernel_state["seen"]},
+          "dnsNames": dict(dns_state),
           "rdnsPending": len(rdns_pending)})
     return nextprev
 
@@ -1336,6 +1430,7 @@ def handle(cmd, hist):
 def main():
     threading.Thread(target=process_watcher, daemon=True).start()
     threading.Thread(target=kernel_log_reader, daemon=True).start()
+    threading.Thread(target=dns_follower, daemon=True).start()
     hist = History()
     prev = {}
     geo_status()

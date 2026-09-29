@@ -122,6 +122,22 @@ Column {
     onClicked: root.s.setPref("catchShort", root.s.prefs.catchShort === false)
   }
 
+  Lbl {
+    p: root.p
+    width: parent.width
+    visible: root.s.dnsNames.state !== "off"
+    dim: root.s.dnsNames.state === "on"
+    color: root.s.dnsNames.state === "denied" ? root.p.urgent : root.p.foreground
+    wrapMode: Text.WordWrap
+    maximumLineCount: 4
+    font.pixelSize: Style.font.caption
+    text: root.s.dnsNames.state === "on"
+          ? "Host names: from the names apps look up (" + root.s.dnsNames.seen + " addresses learned)."
+        : root.s.dnsNames.state === "denied"
+          ? "Host names: reverse DNS only, so policies often end up per address. Install citadel-helper 1.3.2 or newer to let Citadel read the names apps look up."
+        : "Host names: reverse DNS only (" + (root.s.dnsNames.error || "systemd-resolved unavailable") + ")."
+  }
+
   // ---------------------------------------------------------------- proxies
   PanelSeparator { foreground: root.p.foreground }
   PanelSectionHeader { text: "PROXIES"; foreground: root.p.foreground; fontFamily: root.p.fontFamily }

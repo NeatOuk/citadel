@@ -224,5 +224,20 @@ eq("origin: kept when given", M.makeRule({ app: CH, origin: "gate" }).origin, "g
   eq("citadel json passes through", [cj.format, cj.rules.length], ["citadel", 1])
 }
 
+// updates to a new path per version (mise, asdf, nvm, Nix)
+{
+  const OLD = "/home/u/.local/share/mise/installs/claude/2.1.281/claude"
+  const NEW = "/home/u/.local/share/mise/installs/claude/2.1.283/claude"
+  eq("family: mise", M.appFamily(NEW), "/home/u/.local/share/mise/installs/claude/*/claude")
+  eq("family: nvm v-prefix and rc", M.appFamily("/home/u/.nvm/versions/node/v22.1.0-rc.1/bin/node"), "/home/u/.nvm/versions/node/*/bin/node")
+  eq("family: nix store", M.appFamily("/nix/store/0123456789abcdfghijklmnpqrsvwxyz-claude-code-2.1.283/bin/claude"),
+     "/nix/store/nix:claude-code/bin/claude")
+  eq("family: no version part", M.appFamily("/usr/bin/python3.14"), "")
+  const rules = [M.makeRule({ app: OLD, action: "allow", createdAt: 5 }), M.makeRule({ app: CURL, action: "allow" })]
+  eq("updated from the old path", M.updatedFrom(NEW, rules), OLD)
+  eq("not when the new path has a policy", M.updatedFrom(NEW, rules.concat([M.makeRule({ app: NEW, host: "x.example" })])), "")
+  eq("not for another app", M.updatedFrom("/home/u/.local/share/mise/installs/node/26.8.2/bin/node", rules), "")
+}
+
 console.log(`${n - fails}/${n} passed`)
 process.exit(fails ? 1 : 0)

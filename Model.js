@@ -358,6 +358,43 @@ function ruleFromAlert(alert, action, scope, duration, profile, appInfo, viaScop
   })
 }
 
+// Apps that install each version to its own path (mise, asdf, nvm, Nix, …):
+// the path with its version parts replaced, or "" when it has none. Two paths
+// of one family are the same app before and after an update.
+var VERSION_PART = /^v?[0-9]+(\.[0-9]+)+([-+_~][0-9A-Za-z.+_~-]*)?$/
+var NIX_STORE_PART = /^[0-9a-z]{32}-(.+?)(-[0-9][0-9A-Za-z.+_~-]*)?$/
+function appFamily(exe) {
+  if (!exe || String(exe).charAt(0) !== "/") return ""
+  var parts = String(exe).split("/"), changed = false
+  for (var i = 0; i < parts.length; i++) {
+    if (VERSION_PART.test(parts[i])) {
+      parts[i] = "*"
+      changed = true
+    } else if (i === 3 && parts[1] === "nix" && parts[2] === "store") {
+      var m = NIX_STORE_PART.exec(parts[i])
+      if (m) {
+        parts[i] = "nix:" + m[1]
+        changed = true
+      }
+    }
+  }
+  return changed ? parts.join("/") : ""
+}
+
+// The older path whose policies an updated app can keep: the newest policy's
+// app of the same family, when this exact path has no policy yet. "" otherwise.
+function updatedFrom(exe, rules) {
+  var fam = appFamily(exe)
+  if (!fam) return ""
+  var best = null
+  for (var i = 0; i < (rules || []).length; i++) {
+    var r = rules[i]
+    if (r.app === exe) return ""
+    if (r.app && r.app !== "*" && appFamily(r.app) === fam && (!best || r.createdAt > best.createdAt)) best = r
+  }
+  return best ? best.app : ""
+}
+
 // ------------------------------------------------------------------ nft spec
 
 function uniq(arr) {

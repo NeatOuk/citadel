@@ -60,6 +60,7 @@ Item {
   property var groups: []
   property var alerts: []                   // queue, oldest first
   property var session: ({})                // alertKey -> "allow"|"deny" (once)
+  property var newApps: ({})                // updated apps you chose to treat as new (this session)
   property var resolved: ({})
   property var stats: ({ series: [], topAppsToday: [], topHostsToday: [], countriesToday: [], topApps7d: [] })
   property var listStatus: ({})
@@ -69,6 +70,7 @@ Item {
   property var protectedPids: ({})          // Citadel's monitor and the shell hosting it
   property var recentShort: []              // short connections the poll missed (newest first)
   property var kernelLog: ({ running: false, error: "", seen: 0 })
+  property var dnsNames: ({ state: "off", error: "", seen: 0 })
   property string helperVersion: ""         // from `citadel-enforcer status` (1.2+)
   property bool helperLogging: false
   readonly property bool helperSupportsShort: helperVersion !== "" && Number(helperVersion.split(".")[1]) >= 2
@@ -249,6 +251,7 @@ Item {
     apps = m.apps || {}
     network = m.network || { names: [], ssid: "" }
     if (m.kernelLog) kernelLog = m.kernelLog
+    if (m.dnsNames) dnsNames = m.dnsNames
     var first = ticks === 0
     ticks++
     _pruneExpiredRules()
@@ -260,12 +263,7 @@ Item {
     var logged = []
     for (var i = 0; i < conns.length; i++) {
       var c = conns[i]
-      var d = Model.decide(c, rules, ctx)
-      // binary changed since the user allowed it -> ask again
-      if (d.source === "rule" && d.verdict === "allow" && d.rule.exeHash && c.exe && apps[c.exe]) {
-        var h = (apps[c.exe].trust || {}).hash
-        if (h && h !== d.rule.exeHash) d = { verdict: "prompt", source: "changed", rule: d.rule }
-      }
+      var d = _decide(c, ctx)
       dec[c.key] = d
       up += c.upRate || 0
       down += c.downRate || 0
@@ -286,7 +284,7 @@ Item {
       var recent = []
       for (var k = 0; k < shorts.length; k++) {
         var sc = shorts[k]
-        var sd = Model.decide(sc, rules, ctx)
+        var sd = _decide(sc, ctx)
         recent.push({ conn: sc, decision: sd })
         if (first) continue
         // a routed connection the proxy just reset: already blocked and logged,
@@ -321,14 +319,65 @@ Item {
     if (enforce) _syncEnforcement(first)
   }
 
+  // Model.decide, plus two gate cases: an allowed program that changed since
+  // (same path, new checksum), and an app that updated to a new path (mise,
+  // asdf, nvm, Nix …) while its policies are still on the old one.
+  function _decide(c, ctx) {
+    var d = Model.decide(c, rules, ctx)
+    if (d.source === "rule" && d.verdict === "allow" && d.rule.exeHash && c.exe && apps[c.exe]) {
+      var h = (apps[c.exe].trust || {}).hash
+      if (h && h !== d.rule.exeHash) d = { verdict: "prompt", source: "changed", rule: d.rule }
+    } else if (d.verdict === "prompt" && d.source === "none" && c.exe && !newApps[c.exe]) {
+      var old = Model.updatedFrom(c.exe, rules)
+      if (old) d = { verdict: "prompt", source: "updated", rule: null, from: old }
+    }
+    return d
+  }
+
   // ------------------------------------------------- alerts
+  // one request per destination; an updated app asks once for all of them
   function _queueAlert(queue, conn, d) {
-    var key = Model.alertKey(conn)
+    var key = d.source === "updated" ? "update|" + conn.exe : Model.alertKey(conn)
     for (var i = 0; i < queue.length; i++) if (queue[i].key === key) return
     var info = apps[conn.exe] || null
-    queue.push({ key: key, conn: conn, firstSeen: now, changed: d.source === "changed", short: !!conn.short,
-                 trust: info ? info.trust : { level: "unknown" }, hasOwnScope: !!(info && info.owned && info.owned.length) })
-    if (prefs.notify !== false) _notify(conn, d.source === "changed")
+    var alert = { key: key, conn: conn, firstSeen: now, changed: d.source === "changed", short: !!conn.short,
+                  trust: info ? info.trust : { level: "unknown" }, hasOwnScope: !!(info && info.owned && info.owned.length) }
+    if (d.source === "updated") {
+      alert.updatedFrom = d.from
+      alert.policies = rules.filter(function(r) { return r.app === d.from }).length
+    }
+    queue.push(alert)
+    if (prefs.notify !== false) _noteLater(alert)
+  }
+
+  // An updated app: "keep" moves the old path's policies to the new one;
+  // anything else asks about it like a new app (connection by connection).
+  function _answerUpdate(alert, choice, source) {
+    var exe = alert.conn.exe, old = alert.updatedFrom
+    alerts = alerts.filter(function(a) { return a.key !== alert.key })
+    if (choice === "keep") {
+      var h = ((apps[exe] || {}).trust || {}).hash || ""
+      rules = rules.map(function(r) {
+        return r.app === old ? Model.makeRule(Object.assign({}, r, { app: exe, exeHash: r.exeHash ? h : "" })) : r
+      })
+      _log([_logEntry(alert.conn, "allow", source || "you · kept its policies after an update")])
+      save()
+      _sendConfig()
+      _reevaluate()
+      if (enforce) _syncEnforcement(true)
+      return
+    }
+    var n = Object.assign({}, newApps)
+    n[exe] = true
+    newApps = n
+    var ctx = _ctx(), queue = alerts.slice()
+    conns.forEach(function(c) {
+      if (c.exe !== exe) return
+      var d = _decide(c, ctx)
+      if (d.verdict === "prompt") _queueAlert(queue, c, d)
+    })
+    alerts = queue
+    _reevaluate()
   }
 
   // Answer the oldest (or given) alert.
@@ -338,6 +387,7 @@ Item {
     var alert = null
     for (var i = 0; i < alerts.length; i++) if (alerts[i].key === key) { alert = alerts[i]; break }
     if (!alert) return
+    if (alert.updatedFrom) return _answerUpdate(alert, action, source)
     if (duration === "once") {
       var s = Object.assign({}, session)
       s[key] = action
@@ -381,11 +431,46 @@ Item {
     }
   }
 
+  // A burst of requests from one app (a new session opening ten connections)
+  // shares one notification.
+  property var _notePending: ({})           // app key -> true
+  function _noteKey(alert) {
+    return alert.updatedFrom ? alert.key : "app|" + (alert.conn.exe || alert.conn.app || "?") + "|" + (alert.conn.viaId || "")
+  }
+  function _noteLater(alert) {
+    var p = Object.assign({}, _notePending)
+    p[_noteKey(alert)] = true
+    _notePending = p
+    noteTimer.restart()
+  }
+  Timer {
+    id: noteTimer
+    interval: 400
+    onTriggered: {
+      var keys = Object.keys(root._notePending)
+      root._notePending = {}
+      keys.forEach(function(k) {
+        var waiting = root.alerts.filter(function(a) { return root._noteKey(a) === k })
+        if (waiting.length) root._notify(waiting)
+      })
+    }
+  }
+
   Process { id: notifyProc; stdout: StdioCollector { id: notifyOut; waitForEnd: true }
     onExited: if (String(notifyOut.text || "").indexOf("default") !== -1) root.openRequested("gate") }
-  function _notify(conn, changed) {
-    var title = changed ? "Changed app at the gate" : "At the gate"
-    var body = Model.appWithOrigin(conn) + " → " + Model.destLabel(conn) + ":" + conn.rport
+  function _notify(waiting) {
+    var a = waiting[0], conn = a.conn
+    var title, body
+    if (a.updatedFrom) {
+      title = "Updated app at the gate"
+      body = Model.appWithOrigin(conn) + " updated · " + a.policies + (a.policies === 1 ? " policy" : " policies")
+           + " for the old version: keep them?"
+    } else {
+      title = waiting.some(function(x) { return x.changed }) ? "Changed app at the gate" : "At the gate"
+      var dests = waiting.map(function(x) { return Model.destLabel(x.conn) + ":" + x.conn.rport })
+      body = Model.appWithOrigin(conn) + " → " + dests.slice(0, 2).join(", ")
+           + (dests.length > 2 ? " and " + (dests.length - 2) + " more" : "")
+    }
     var cmd = ["notify-send", "-a", "Citadel", title, body]
     if (notifyProc.running) { Quickshell.execDetached(cmd); return }
     notifyProc.command = cmd.slice(0, 1).concat(["-A", "default=Decide", "-w"], cmd.slice(1))

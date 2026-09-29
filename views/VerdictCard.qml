@@ -6,6 +6,7 @@ import "../Model.js" as Model
 
 // One request at the gate: who wants out, where to, and three quick
 // verdicts. "Adjust" reveals what Block / Always allow cover and for how long.
+// An app that updated to a new path asks once instead: keep its policies?
 Column {
   id: root
   property var p: null          // panel (colors, fonts)
@@ -23,6 +24,7 @@ Column {
   readonly property var ex: s && alert ? s.explanationOf(conn) : null
   readonly property int remaining: alert && s && Number(s.prefs.alertTimeout) > 0
     ? Math.max(0, Math.round(Number(s.prefs.alertTimeout) - (s.now - alert.firstSeen))) : -1
+  readonly property bool updated: !!(alert && alert.updatedFrom)
   readonly property bool hasVia: !!(conn && conn.via)
   // a launcher worth scoping to: scripts and programs, not "you, in a terminal"
   readonly property bool viaDefault: hasVia && conn.viaKind !== "terminal"
@@ -40,6 +42,14 @@ Column {
     if (l === "modified") return { text: "integrity ✕ modified", bad: true, warn: false }
     if (l === "suspicious") return { text: "integrity ✕ " + (t.reason || "suspicious"), bad: true, warn: false }
     return { text: "integrity: unknown", bad: false, warn: true }
+  }
+  // "2.1.281 → 2.1.283": the parts of the two paths that differ
+  function versionChange(a, b) {
+    var x = String(a || "").split("/"), y = String(b || "").split("/"), out = []
+    if (x.length !== y.length) return ""
+    for (var i = 0; i < x.length; i++)
+      if (x[i] !== y[i]) out.push(x[i].replace(/^[0-9a-z]{32}-/, "") + " → " + y[i].replace(/^[0-9a-z]{32}-/, ""))
+    return out.join(" ")
   }
   function verdict(action, duration) {
     s.answer(alert.key, action, scope, duration, "", hasVia && viaScoped, route)
@@ -102,6 +112,42 @@ Column {
     maximumLineCount: 3
   }
 
+  // an update to a new path
+  Lbl {
+    p: root.p
+    width: parent.width
+    visible: root.updated
+    text: "Updated " + root.versionChange(root.alert ? root.alert.updatedFrom : "", root.conn.exe)
+          + ". Its " + (root.alert && root.alert.policies === 1 ? "policy is" : (root.alert ? root.alert.policies : 0) + " policies are")
+          + " for the old version. Keep them for this one, or answer its connections one by one like a new app's."
+    wrapMode: Text.WordWrap
+    maximumLineCount: 4
+  }
+  RowLayout {
+    width: parent.width
+    spacing: Style.space(6)
+    visible: root.updated
+    Button {
+      Layout.fillWidth: true
+      text: "Ask as a new app"
+      foreground: root.p.foreground
+      fontSize: Style.font.bodySmall
+      bordered: true
+      tooltipText: "Its connections come to the gate one by one"
+      onClicked: root.s.answer(root.alert.key, "new", "app", "forever", "", false, "default")
+    }
+    Button {
+      Layout.fillWidth: true
+      text: "Keep its policies"
+      foreground: root.p.foreground
+      fontSize: Style.font.bodySmall
+      bordered: true
+      selected: true
+      tooltipText: "Move the old version's policies to this one"
+      onClicked: root.s.answer(root.alert.key, "keep", "app", "forever", "", false, "default")
+    }
+  }
+
   Lbl {
     p: root.p
     width: parent.width
@@ -116,6 +162,7 @@ Column {
 
   // where
   Rectangle {
+    visible: !root.updated
     width: parent.width
     height: dest.implicitHeight + Style.space(12)
     color: Qt.rgba(root.p.foreground.r, root.p.foreground.g, root.p.foreground.b, 0.05)
@@ -162,7 +209,7 @@ Column {
   Column {
     width: parent.width
     spacing: Style.space(2)
-    visible: !!root.s
+    visible: !!root.s && !root.updated
     RowLayout {
       width: parent.width
       spacing: Style.space(8)
@@ -247,6 +294,7 @@ Column {
 
   // verdicts
   RowLayout {
+    visible: !root.updated
     width: parent.width
     spacing: Style.space(6)
     Button {
@@ -283,6 +331,7 @@ Column {
     width: parent.width
     LinkButton {
       p: root.p
+      visible: !root.updated
       text: root.adjusting ? "Adjust ▾" : "Adjust ▸"
       onClicked: root.adjusting = !root.adjusting
     }
@@ -292,14 +341,15 @@ Column {
       horizontalAlignment: Text.AlignRight
       dim: true
       visible: root.remaining >= 0
-      text: (root.s && root.s.prefs.alertDefault === "deny" ? "blocks" : "lets through") + " once in " + root.remaining + "s"
+      text: root.updated ? "asks as a new app in " + root.remaining + "s"
+            : (root.s && root.s.prefs.alertDefault === "deny" ? "blocks" : "lets through") + " once in " + root.remaining + "s"
       font.pixelSize: Style.font.caption
     }
   }
 
   // adjust: what Block / Always allow cover
   Column {
-    visible: root.adjusting
+    visible: root.adjusting && !root.updated
     width: parent.width
     spacing: Style.space(5)
     Lbl { p: root.p; dim: true; text: "Covers"; font.pixelSize: Style.font.caption }
