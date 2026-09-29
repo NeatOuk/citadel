@@ -196,7 +196,7 @@ eq("origin: kept when given", M.makeRule({ app: CH, origin: "gate" }).origin, "g
   eq("filter: blocks", ids({ show: "deny" }), ["g1"])
   eq("filter: via proxy", ids({ show: "proxy" }), ["y2"])
   eq("search: app basename", ids({ query: "remmina" }), ["y1"])
-  eq("search: host part", ids({ query: "168.1" }), ["y1"])
+  eq("search: host part", ids({ query: "16.1" }), ["y1"])
   eq("search: proxy name", ids({ query: "office" }), ["y2"])
   eq("search: every word must match", ids({ query: "msedge office" }), ["y2"])
   eq("filter: zone keeps all-zone policies", ids({ profile: "Home" }), ["y1", "y2", "g1"])
