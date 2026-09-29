@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "neat.citadel",
   "name": "Citadel",
-  "version": "1.1.2",
+  "version": "1.2.0",
   "author": "Neat Ouk",
   "license": "MIT",
-  "description": "An outbound firewall in your bar. When an app connects somewhere new, it waits at the gate: see the app, its integrity, host, country and port, then Block, Allow once or Always allow. Policies per app, zones per network, threat feeds, live traffic and history. Watching works on its own; to block, install citadel-helper (github.com/NeatOuk/citadel-helper), a small root package that applies your policies with nftables.",
+  "description": "An outbound firewall in your bar. When an app connects somewhere new, it waits at the gate: see the app, who started it, its integrity, host, country and port, then Block, Allow once or Always allow. Policies per app, zones per network, threat feeds and AdGuard/Pi-hole imports, per-app proxy routing, live traffic and history. Watching works on its own; to block, install citadel-helper (github.com/NeatOuk/citadel-helper), a small root package that applies your policies with nftables.",
   "kinds": [
     "bar-widget"
   ],
@@ -34,7 +34,7 @@
     "optional": {
       "networkmanager": "zone switching by connection name (iwd and wired interfaces also work)",
       "python-maxminddb": "countries",
-      "citadel-helper": ">= 1.1.1 (tag v1.1.1) for enforcement: https://github.com/NeatOuk/citadel-helper (build with makepkg -si)"
+      "citadel-helper": ">= 1.1.1 to block; 1.3.2 (tag v1.3.2) for every feature: short connections, proxy routing, host names. https://github.com/NeatOuk/citadel-helper (build with makepkg -si)"
     },
     "groups": {
       "wheel": "run the helper without a password prompt"

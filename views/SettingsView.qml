@@ -104,7 +104,7 @@ Column {
     maximumLineCount: 4
     font.pixelSize: Style.font.caption
     text: "Blocking needs citadel-helper. Build and install it once:\n"
-          + "git clone https://github.com/NeatOuk/citadel-helper.git && cd citadel-helper && makepkg -si"
+          + "git clone --branch v1.3.2 https://github.com/NeatOuk/citadel-helper.git && cd citadel-helper && makepkg -si"
   }
 
   Toggle {

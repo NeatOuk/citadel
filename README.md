@@ -36,15 +36,22 @@ No account, no telemetry. Everything stays on your machine.
 
 Citadel watches and asks without any extra software. To actually **block**
 traffic it needs **[citadel-helper](https://github.com/NeatOuk/citadel-helper)**,
-a small root helper that turns your policies into nftables rules. **Citadel needs
-citadel-helper 1.1.1 or newer** ([tag `v1.1.1`](https://github.com/NeatOuk/citadel-helper/releases/tag/v1.1.1)),
-which only ever closes your own connections. Settings warns if an older helper
-is installed. Build and install it once:
+a small root helper that turns your policies into nftables rules. This release
+is built and tested with **citadel-helper 1.3.2** ([tag `v1.3.2`](https://github.com/NeatOuk/citadel-helper/releases/tag/v1.3.2)).
+Build and install it once:
 
 ```bash
-git clone https://github.com/NeatOuk/citadel-helper.git
+git clone --branch v1.3.2 https://github.com/NeatOuk/citadel-helper.git
 cd citadel-helper && makepkg -si
 ```
+
+| Helper version | What works |
+|---|---|
+| older than 1.1.1, or the unreleased 1.2.0 build | nothing privileged: both have a security bug, so Citadel never sends them rules or kill requests, and Settings asks you to update |
+| 1.1.1 | blocking |
+| 1.2.1 | + catching very short connections |
+| 1.3.0 | + per-app proxy routing |
+| 1.3.2 | + real host names (lets Citadel read the names apps look up from systemd-resolved) |
 
 An AUR package is coming later.
 
@@ -83,6 +90,7 @@ Citadel never edits your own configuration files. It only writes to `~/.local/sh
 | Proxy logins | `libsecret` (`secret-tool`) and a keyring such as gnome-keyring | only for proxies that need a username and password |
 | Explain | an Omarchy default agent (`omarchy agent --pick`) or any command-line AI tool | optional; see [Explain](#explain) |
 | Enforcement | [`citadel-helper`](https://github.com/NeatOuk/citadel-helper) (built with `makepkg`) → `nftables`, `polkit` | kernel with `nft_socket`, cgroup v2 and `INET_DIAG_DESTROY` (stock Arch has all three) |
+| Host names | `systemd-resolved` (Omarchy's default) and citadel-helper 1.3.2 | otherwise reverse DNS only |
 | Password-free enforcement | membership in `wheel` | otherwise polkit asks for an admin password each time |
 
 ## At a glance
