@@ -1,8 +1,30 @@
 # Citadel
 
-Citadel is an outbound firewall for the Omarchy bar. Your apps sit inside the
-walls. Whenever one tries to reach somewhere new, it waits **at the gate** for your verdict.
-Everything you decide becomes a **policy** that Citadel enforces with nftables.
+**Your local firewall, taken to the next level.**
+
+A normal firewall guards the door: it decides which ports are open to the
+outside. Citadel guards the way out. It knows **which app** is making each
+connection, asks you the first time it tries to reach somewhere new, and
+remembers your answer.
+
+Citadel lives in the Omarchy bar as a small tower. Your apps sit inside the
+walls. When one tries to reach somewhere new, it waits **at the gate** for your
+verdict: **Block**, **Allow once** or **Always allow**. Everything you decide
+becomes a **policy** that Citadel enforces with nftables, per app.
+
+| A typical firewall | Citadel |
+|---|---|
+| Rules by port and address | Rules by **app**, host, IP range, port, or any mix |
+| Set up once, then silent | **Asks** when an app does something new |
+| Can't tell apps apart | Shows the app, its **integrity** (checked against pacman's checksums), and where it's going: host, country, port |
+| One rule set everywhere | **Zones**: different policies at home, at work, on café Wi-Fi |
+| No record of what happened | Live **traffic** per app, plus **history** of top apps, hosts and countries |
+| Manual block lists | One-click **threat feeds**: FireHOL, Spamhaus DROP, StevenBlack, HaGeZi |
+
+Three **modes** cover the rest. **Guarded** asks, **Open** lets everything
+through and logs it, and **Lockdown** blocks anything not allowed.
+
+No account, no telemetry. Everything stays on your machine.
 
 <p align="center">
   <img src="docs/screenshots/gate-card.png" width="440" alt="A connection waiting at the gate: python3.14 wants to reach 208.67.222.222 on port 443, with Block, Allow once and Always allow buttons">
