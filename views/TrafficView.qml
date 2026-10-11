@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Layouts
 import qs.Commons
+import qs.Commons as C   // Qt 6.12's QtQuick has its own Color type, which hides ours
 import qs.Ui
 import "../Model.js" as Model
 
@@ -22,7 +23,7 @@ Column {
   function statusColor(d) {
     if (!d) return p.dim
     if (d.verdict === "deny") return p.urgent
-    if (d.verdict === "prompt") return Color.accent
+    if (d.verdict === "prompt") return C.Color.accent
     if (d.verdict === "system") return Qt.darker(p.dim, 1.4)
     return p.foreground
   }
@@ -159,7 +160,7 @@ Column {
           Rectangle {
             width: Style.space(7); height: width; radius: width / 2
             color: grp.modelData.denied > 0 ? root.p.urgent
-                 : grp.modelData.prompts > 0 ? Color.accent
+                 : grp.modelData.prompts > 0 ? C.Color.accent
                  : grp.modelData.system ? Qt.darker(root.p.dim, 1.4) : root.p.foreground
           }
           Lbl {

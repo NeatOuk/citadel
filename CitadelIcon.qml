@@ -1,5 +1,6 @@
 import QtQuick
 import qs.Commons
+import qs.Commons as C   // Qt 6.12's QtQuick has its own Color type, which hides ours
 import qs.Ui
 
 // Citadel's mark: a keep with three battlements and a gate arch, drawn on a
@@ -12,8 +13,8 @@ Item {
   id: root
 
   property real iconSize: Style.font.icon
-  property color color: Color.foreground
-  property color badgeColor: Color.urgent
+  property color color: C.Color.foreground
+  property color badgeColor: C.Color.urgent
   property string mode: "guarded"
   property int pendingCount: 0
 
@@ -96,6 +97,6 @@ Item {
     height: width
     radius: width / 2
     color: root.badgeColor
-    borderSpec: Border.flat(Color.popups.background, 1)
+    borderSpec: Border.flat(C.Color.popups.background, 1)
   }
 }
