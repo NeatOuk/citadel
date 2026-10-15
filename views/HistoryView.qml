@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Layouts
 import qs.Commons
+import qs.Commons as C   // Qt 6.12's QtQuick has its own Color type, which hides ours
 import qs.Ui
 import "../Model.js" as Model
 
@@ -25,7 +26,7 @@ Column {
   RowLayout {
     width: parent.width
     PanelSectionHeader { text: "LAST HOUR"; foreground: root.p.foreground; fontFamily: root.p.fontFamily; Layout.fillWidth: true }
-    Lbl { p: root.p; text: "↓ " + Model.humanBytes(root.hourTotals.down); color: Color.accent; font.pixelSize: Style.font.caption }
+    Lbl { p: root.p; text: "↓ " + Model.humanBytes(root.hourTotals.down); color: C.Color.accent; font.pixelSize: Style.font.caption }
     Lbl { p: root.p; text: "↑ " + Model.humanBytes(root.hourTotals.up); color: root.p.urgent; font.pixelSize: Style.font.caption }
   }
   Sparkline {
@@ -33,7 +34,7 @@ Column {
     width: parent.width
     height: Style.space(70)
     series: root.series
-    downColor: Color.accent
+    downColor: C.Color.accent
     upColor: root.p.urgent
     gridColor: Qt.rgba(root.p.foreground.r, root.p.foreground.g, root.p.foreground.b, 0.08)
   }
@@ -81,7 +82,7 @@ Column {
           anchors.verticalCenter: parent.verticalCenter
           height: parent.height - Style.space(4)
           width: parent.width * ((modelData.up || 0) + (modelData.down || 0)) / bl.maxBytes
-          color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.16)
+          color: Qt.rgba(C.Color.accent.r, C.Color.accent.g, C.Color.accent.b, 0.16)
         }
         Lbl {
           p: root.p

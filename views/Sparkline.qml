@@ -1,12 +1,13 @@
 import QtQuick
 import qs.Commons
+import qs.Commons as C   // Qt 6.12's QtQuick has its own Color type, which hides ours
 
 // Two-series area chart (download filled, upload line) for per-minute bytes.
 Item {
   id: root
   property var series: []          // [{t, up, down}]
-  property color downColor: Color.accent
-  property color upColor: Color.urgent
+  property color downColor: C.Color.accent
+  property color upColor: C.Color.urgent
   property color gridColor: Qt.rgba(1, 1, 1, 0.08)
   readonly property real peak: {
     var m = 0
